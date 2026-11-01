@@ -54,7 +54,7 @@ The worker keeps the loaded model and each stage's results, and reruns only the 
 |---|---|---|
 | Parse, weld, hull | file, units | a new file is loaded or the units change |
 | Equilibria, destination table, basins, barriers | hull, COM, shallow-pose threshold | the COM or the threshold changes |
-| Impact precompute (per support edge) | pose, mass, inertia, μ | the pose, mass properties or μ change |
+| Pivot models (per support edge and corner) | pose, mass, inertia | the pose or mass properties change |
 | Heatmap | impact precompute, hit direction | the hit settings change |
 
 Mass on its own doesn't change the statics (poses, probabilities, tilt angles); it only scales energies. Editing the mass therefore never reruns the basin map.
@@ -63,40 +63,41 @@ Mass on its own doesn't change the statics (poses, probabilities, tilt angles); 
 
 ```
 src/
-  core/                 pure TS: no DOM, no three.js
-    vec.ts              Vec3 helpers
-    units.ts
+  core/                 pure TS: no DOM, no three.js; runs in the worker, Vitest and Node
+    vec.ts  units.ts  types.ts
     io/stl.ts           binary and ASCII STL
     io/obj.ts
-    io/massReport.ts    SolidWorks Mass Properties paste parser
-    io/sidecar.ts       JSON mass properties format
+    io/massReport.ts    SolidWorks Mass Properties paste parser, and the JSON format
     weld.ts             hash-based vertex welding
-    hull.ts             quickhull3d → polygon half-edge Hull
+    hull.ts             quickhull3d → polygon hull, adjacency, support queries
+    displayMesh.ts      the drawn and painted mesh (§3.7)
     equilibria.ts       stable faces, edge saddles, vertex maxima
     roll.ts             quasi-static roll, per-face destination table, path recording
     sphere.ts           icosphere levels and per-vertex area weights
-    basins.ts
-    barriers.ts         saddle graph, merge tree, simplification, margins
+    barriers.ts         merge tree, simplification, escape and pairwise barriers
     tipPath.ts          planar tip path along a great circle
-    inertia.ts          fallback inertia estimate
-    impact.ts           per-edge precompute, J_min, validity, F_min, weapon impulse
-    heatmap.ts
+    inertia.ts          volume moments and the fallback inertia estimate
+    impact.ts           edge and corner pivot models, J_min, F_min, validity, weapon impulse
+    heatmap.ts          allocation-free per-vertex kernel
     sample.ts           generated sample bot
+    testShapes.ts       boxes, prisms and a tetrahedron for tests
+    *.test.ts
   worker/
     protocol.ts         request and response types
     analysis.worker.ts
-    client.ts           main-thread wrapper: ids, superseding, progress
-  viewer/               three.js, imperative, renders on demand
-    Viewer.ts
-    botMesh.ts  hullOverlay.ts  supportOverlay.ts  basinShell.ts  rollAnimator.ts  heatmap.ts
-  ui/                   React components
-  state.ts              app state and reducer
+    client.ts           main-thread wrapper: ids, superseding, progress, partial results
+  viewer/
+    Viewer.ts           three.js scene, on-demand rendering, picking, roll animation
+    colors.ts           pose palette and heatmap ramp
+  ui/                   MassPanel, PoseList, HitControls, Overlays, format helpers
   App.tsx  main.tsx  index.css
-bench/                  Node timing scripts
+bench/
+  pipeline.ts         stage timings in Node (pnpm bench)
+  ui.ts               headless Chromium screenshots and timings (pnpm ui-check)
 docs/SPEC.md
 ```
 
-**Dependencies:** `three` and `quickhull3d`. Dev dependencies: `vitest` and `@types/three`. No UI kit and no state library.
+**Dependencies:** `three` and `quickhull3d`. Dev dependencies: `vitest`, `@types/three` and `playwright` (for `bench/ui.ts`). No UI kit and no state library: app state is plain React state in `App.tsx`.
 
 ### 2.2 Conventions
 
@@ -104,52 +105,45 @@ docs/SPEC.md
 - **Frames:** the body frame is the file's frame. Core math runs in the body frame shifted so the COM is at the origin.
 - **Orientation:** described by the body-frame **down vector** `u`, a unit vector. A pose is a stable hull face, and its `u` is that face's outward normal.
 - **World frame:** rendering is Z-up, with the ground at z = 0.
+- **Orientation independence:** the app never asks which way is up or front, and nothing depends on how the model was oriented in CAD.
+  - Poses are lettered by probability.
+  - A pose is displayed with the hull's major horizontal axis (2D PCA of the hull vertices projected onto the ground) along world X.
+  - Hit directions are set relative to the camera.
 - **Precision:** Float64 in core, Float32 only for GPU buffers.
 - **Tolerances:** relative to the bounding-box diagonal unless stated otherwise.
 - **Code style:** 2-space indent, single quotes, no semicolons (matching the template), `const` over `let`.
 
 ### 2.3 Data model
 
+The authoritative types live in `src/worker/protocol.ts` and `src/core/*.ts`. The shapes that cross the worker boundary:
+
 ```ts
-type Vec3 = [number, number, number]
-
 interface MassProps {
-  mass: number                   // kg
-  com: Vec3                      // m, body frame
-  inertia: Sym3 | null           // kg·m² about the COM, body axes
-  source: 'report' | 'json' | 'manual'
+  mass: number                    // kg
+  com: Vec3                       // m, body frame
+  inertia: Mat3 | null            // kg·m² about the COM, body axes; null → estimated
 }
 
-interface Hull {
-  verts: Float64Array            // xyz, COM at origin
-  faces: HullFace[]              // convex polygons, CCW seen from outside, no collinear verts
-  edges: HullEdge[]              // each edge once: verts a, b; faces left, right
-  // plus CSR adjacency: vertex → edges, vertex → faces
-}
-
-interface Pose {
-  id: number
+interface PoseInfo {              // one pose after folding shallow ones
   face: number
-  down: Vec3
-  height: number                 // COM height at rest, m
-  probability: number            // share of orientations that roll here
-  inset: number                  // m, projected COM to the nearest support-polygon edge
-  tiltToTip: number              // rad, smallest tilt that tips it (§3.6)
+  down: Vec3                      // body-frame down vector
+  height: number                  // COM height at rest, m
+  inset: number                   // projected COM to the nearest support edge, m
+  tilt: number                    // tilt-to-tip, rad
+  probability: number
   escape: { lift: number, to: number } | null
-  merged: number[]               // raw poses folded in by simplification
+  support: Vec3[]                 // support polygon, relative to the COM
+  folded: number                  // shallow poses folded into this one
 }
 
-interface Saddle { edge: number, down: Vec3, height: number, sides: [number, number] }
-interface Maximum { vertex: number, down: Vec3, height: number }
-
-interface Analysis {
-  poses: Pose[]                  // after simplification, sorted by probability
-  saddles: Saddle[]
-  maxima: Maximum[]
-  euler: { stable: number, saddles: number, maxima: number, ok: boolean }  // raw counts
-  tree: MergeNode[]              // lift(A → B) = join height − height(A)
+interface AnalysisResult {
+  version: number                 // ties later requests (roll, heatmap, probe) to this analysis
+  poses: PoseInfo[]
+  lift: Float64Array              // lift[i·P + j]: COM rise from pose i to pose j, m
+  euler: { stable: number, saddles: number, maxima: number }   // raw counts
   basinLevel: number
-  basin: Int16Array              // destination pose per icosphere vertex
+  basin: Int16Array               // pose per icosphere vertex
+  final: boolean                  // false for the streamed coarse result
 }
 ```
 
@@ -159,18 +153,18 @@ Barriers are stored as COM lifts in metres and multiplied by m·g only for displ
 
 - Every request carries an increasing `id`.
 - A newer request of the same kind supersedes an older one. Long loops run in chunks, yield between chunks, and stop if a newer request has arrived.
-- Each response is one of `progress` (a fraction and a stage label), `result` or `error`.
+- Each response is one of `progress` (a fraction and a stage label), `partial` (an early result), `result`, `error` or `cancelled`.
 - Large arrays are passed as transferables, which hands them over without copying.
 
 | Request | Payload | Result |
 |---|---|---|
-| `load` | file bytes, format, unit scale | render mesh (indexed Float32 positions), hull summary, bounding box |
-| `analyze` | COM, threshold, basin level | `Analysis`, streamed: coarse level first, then refined |
-| `roll` | starting `down` vector | path keyframes |
-| `heatmap` | pose, mass properties, μ, hit spec | Float32Array per render vertex (J or F; `Infinity` where nothing pivots) |
-| `probe` | pose, mass properties, μ, e, point, normal, hit spec | per-edge breakdown for the readout |
+| `load` | the `File` (or none, for the sample bot), unit scale | display mesh (Float32 positions, normals, indices), hull vertices, uniform-density centroid, size |
+| `analyze` | COM, threshold, basin level | `AnalysisResult`: partial at level 4, then final |
+| `roll` | analysis version, starting `down` vector | path segments and the landing pose |
+| `heatmap` | analysis version, pose, mass properties, hit spec | Float32Array per display vertex (J or F; NaN where the direction can't reach; Infinity where nothing flips). Worst-direction mode sends a partial after its first pass. |
+| `probe` | analysis version, pose, mass properties, hit spec, ray in body coordinates, weapon | hit point, direction used, J or F, pivot (edge or corner), landing pose, weapon impulse, or the reason nothing flips |
 
-The worker caches the per-edge impact precompute, keyed by pose, mass properties and μ.
+Sending the `File` rather than its bytes lets a units change re-read it without the main thread keeping a 93 MB copy. The worker caches pivot models keyed by analysis version, pose, mass and inertia.
 
 ---
 
@@ -182,8 +176,12 @@ This section records what we implement and where it departs from the notes. Depa
 
 1. **Parse** in the worker: binary STL with a DataView, ASCII STL and OBJ line by line.
 2. **Weld** duplicate vertices with a quantized hash. STL stores each vertex about six times.
-3. **Hull** with quickhull3d using `skipTriangulation: true`. Then merge adjacent faces whose normals differ by less than 0.01°, refit each polygon's plane, and drop collinear polygon vertices. This turns each flat face that the STL split into triangles back into a single polygon. Margins and roll logic need true polygons: a flat bottom left as two triangles would treat the diagonal as the nearest edge and get the inset wrong.
-4. **Build** the half-edge `Hull`.
+3. **Hull** with quickhull3d using `skipTriangulation: true`. Its own coplanarity tolerance is far below float32 noise, so flat faces come out split into facets. Margins and roll logic need true polygons: a flat bottom left as two triangles would treat the diagonal as the nearest edge and get the inset wrong. So:
+   - **Change: merge by distance, not angle.** Neighbouring faces merge when every vertex lies within 1e-6 × model size of the group's plane (the plane of its largest face; largest faces first). Merging by a 0.01° angle broke `test_1`: it accepted faces that weren't flat, and stranded a vertex between two faces, which then counted as a fake ninth peak.
+   - A vertex left in exactly two faces is dropped if it lies on their shared line. If it doesn't (two faces meeting at a tiny angle), the facets around it are kept unmerged and the merge is redone.
+   - The result must be closed, consistently oriented and have Euler characteristic 2; otherwise the raw hull is used.
+4. **Build** adjacency (edges with their two faces, vertex neighbours) and a cube-map of seed vertices for support queries.
+5. **Display mesh** for drawing, painting and picking (§3.7).
 
 ### 3.2 Equilibria
 
@@ -219,7 +217,7 @@ A probability means: start at a uniformly random orientation, release at rest, a
 
 ### 3.5 Barriers, simplification and margins
 
-1. **Saddle graph.** For each saddle, step a small angle each way along its edge's arc and roll each side. That gives a link between poses A and B. Skip links where A = B, since a saddle whose sides both drain to the same pose isn't an exit.
+1. **Saddle graph.** Balanced on a saddle, a nudge either way rolls the bot about the edge onto one of its two faces, so the destination table gives the poses on each side directly. That gives a link between poses A and B. Skip links where A = B, since a saddle whose sides both drain to the same pose isn't an exit.
 2. **Merge tree.** Sort the saddles by height and merge poses with union-find (Kruskal's algorithm). Each merge creates a tree node at that saddle's height.
    - The lift from A to B is the height of the node where A and B join, minus A's height.
    - A's escape barrier is the lowest saddle that has A on exactly one side.
@@ -242,8 +240,13 @@ A probability means: start at a uniformly random orientation, release at rest, a
   - Rotate `u` from A's normal about â and follow h(u) along that great circle to its first maximum h_max. Then ΔE = m g (h_max − h0).
   - To do this, walk the Gauss map along the great circle. Inside each vertex region, h is a·cos θ + b·sin θ, so its maximum there has a closed form.
   - For a flat-bottomed box this equals the notes' r_e − h0. For a bot resting on tessellated tires, the bottom face's front edge isn't a saddle: the bot rolls onto the next tire facet long before the COM passes over that edge, so r_e − h0 is badly wrong.
-  - The same path gives the tilt-to-tip angle (the angle at h_max) and the landing pose (roll from just past h_max).
-- Threshold spin: ω* = √(2 ΔE / I_a). Every hit that just tips the bot over this edge leaves it spinning at ω*.
+  - The same path gives the tilt-to-tip angle (the angle at h_max) and the landing pose.
+  - **Change: land by following the plane.** Momentum keeps the bot tipping in the same plane past the top, so the path is followed down to the first new contact that isn't itself falling, and the quasi-static roll starts there. Rolling from rest just past the top sent most of `test_1`'s paths back into the pose they started from.
+- **Threshold spin ω\***: the spin right after the hit that just carries the bot over the top. Every hit that just tips the bot over this edge leaves it spinning at ω*.
+  - **Change: contact changes cost energy.** Each kink in the path is a new contact point P_k landing with speed, modelled as a plastic impact (no bounce, no slip). Angular momentum about P_k is conserved, so the spin after the impact is ω⁺ = ω⁻ (I_G,a + m r_{k−1}·r_k) / (I_G,a + m |r_k|²), where r_k is the COM's offset from P_k perpendicular to the axis.
+  - ω* is found by working backward from zero kinetic energy at the top. With no kinks before the top (a flat-bottomed box), this reduces to √(2 ΔE / I_a).
+  - Losses vanish as tessellation gets finer, so a finely faceted tire behaves like smooth rolling.
+  - If an impact would reverse the spin, this edge can't be tipped over.
 - Constant parts of the reaction:
   - m v_G = m ω* â × r
   - H_q1 = (I_G â + m r × (â × r)) ω*
@@ -263,25 +266,33 @@ A probability means: start at a uniformly random orientation, release at rest, a
 
 Every reaction term scales with J, so validity doesn't depend on the impulse size. It is a property of (p, d, edge) alone. Gravity's impulse during the hit is neglected.
 
-**Result for a hit (p, d):** the smallest J_min over valid edges, with that edge and the pose it lands in. If no edge is valid, report why, checked in this order:
+**Change: corner pivots.** On real bots most hits are off-centre. They lift one end of every support edge, so the bot turns about a single corner P instead. On the sample bot, almost every rising hit was "lifts a corner" before this was added. Per corner, once per pose:
 
-1. **Launches:** both endpoint normals are negative on every edge.
-2. **Lifts a corner:** one endpoint would have to pull. Corner pivots aren't modelled.
-3. **Slides:** friction isn't enough.
+- I_P (inertia about P) and its inverse.
+- The corner's outward directions: the angles between the outward normals of its two edges. For 12 directions across them, a tip path, its threshold spin ω*, gravity lever arm and landing pose, using an axis through P perpendicular to that direction.
 
-**Slow push** (lifters, wedges driving under): F_min = m g ℓ_g / ℓ_F about the same edges, with static equilibrium in place of the impulse balance.
+Per hit (p, d):
+
+1. Spin per unit impulse: w = I_P⁻¹ ((p − P) × d). Angular momentum about P is conserved, because the ground acts only at P.
+2. P is the pivot only if no other support vertex would sink: w · ((Q − P) × up) ≥ 0 for every other vertex Q.
+3. The horizontal part of w is the tipping axis, and its size s is the spin about it per unit impulse. The tipping direction picks the tabulated sample by angle, interpolated.
+4. J_min = ω* / s. The single contact must push and stay inside the friction cone.
+
+**Result for a hit (p, d):** the smallest J_min over valid edge and corner pivots, with that pivot and the pose it lands in. If none is valid, report why: **launches** (the ground would have to pull), **slides** (friction isn't enough), **lifts** (no single contact or edge is consistent), or **returns** (it tips but lands back in the same pose).
+
+**Slow push** (lifters, wedges driving under): F_min = m g ℓ_g / ℓ_F about the same pivots, with static equilibrium in place of the impulse balance. For a corner, the smallest F over its tabulated axes. ℓ_g is the largest gravity lever arm along the tip path.
 
 **Weapon:**
 
-- Effective mass of the bot at the hit point: m_eff = I_a / ℓ².
+- Effective mass of the bot at the hit point: m_eff = I_a / ℓ² for an edge, and 1 / (τᵀ I_P⁻¹ τ) with τ = (p − P) × d for a corner.
 - Impulse delivered: J = (1 + e) v / (1/m_w + 1/m_eff). For a spinner, m_w = I_w / r².
 - The hit flips the bot if J ≥ J_min.
 
 **Known approximations.** These appear in the UI's help text and are what the v1.x sim verifies.
 
-- **Lossless contact changes on the way over.** A path that crosses a sharp hull edge before its top loses energy there, so the real threshold is higher. Flag any path whose largest crossed exterior angle is more than 10°.
-- **Planar motion.** The model assumes the bot keeps tipping about axes parallel to the starting edge.
-- **Corner pivots** are reported but not computed.
+- **Plastic contact changes.** New contacts on the way over neither bounce nor slip.
+- **Planar motion.** The bot keeps tipping about axes parallel to its starting axis; for a corner, the yaw part of the spin is ignored for the tip energy.
+- **Tilt-to-tip** in the pose list uses edges only.
 - **Weapon stopped.** Gyroscopic effects are ignored.
 
 **Inertia source:**
@@ -290,14 +301,23 @@ Every reaction term scales with J, so validity doesn't depend on the impulse siz
 - Otherwise estimate it with uniform density, taken about the user's COM and scaled to the given mass. Use the mesh volume (signed tetrahedra) if the mesh is closed and consistently oriented, and the hull volume otherwise.
 - Results based on an estimate carry an "estimated inertia" badge.
 
-### 3.7 Heatmap
+### 3.7 Display mesh and heatmap
 
-- **Where:** one value per render-mesh vertex, for the selected pose.
-- **Rendering:** the mesh is indexed and drawn with `flatShading`, so CAD edges stay crisp while values sit on welded vertices.
+**Display mesh** (`displayMesh.ts`). CAD exports cover big flat faces with a few long triangles, and welded vertices average normals across sharp edges, so per-vertex values would smear round corners (a top face would take the color of the sides). So:
+
+- Edges longer than size/40 are split (1 → 4, sharing midpoints), giving flat faces interior samples.
+- Vertices are split along creases sharper than 35°, so each side of an edge has its own vertex and normal. Shading is smooth on curves and crisp at creases.
+- On `test_1`, 735k welded vertices become 1.38M display vertices, in 173 ms.
+
+**Heatmap:**
+
+- **Where:** one value per display vertex, for the selected pose.
+- **Shared positions:** copies split along a crease share a position, and the value at a position only depends on the direction. Only "can this direction reach it" (d·n < 0) differs per copy, so the kernel runs once per position.
 - **Direction modes:**
-  - **Fixed:** an azimuth relative to the bot's front, plus an elevation. 0° is horizontal (spinners, side hits from hammers). Positive elevation rises (wedges, flippers).
-  - **Worst:** the lowest J_min over 24 azimuths at the chosen elevation, then refined around the best one for each vertex.
-- **Color:** log scale of J_min in N·s, with a shared legend. Grey means no valid pivot, and hovering says why.
+  - **From camera:** the hit travels horizontally away from the camera, tilted up by the chosen elevation. To pick a direction, orbit to the side you want hit from. 0° is horizontal (spinners, side hits from hammers), and positive elevation rises (wedges, flippers). An arrow in the viewport shows the current direction.
+  - **Worst:** the lowest J_min over 12 azimuths, 30° apart, at the chosen elevation, with no per-vertex refinement. Near the best direction J grows like 1/cos(Δφ), so a miss costs at most 3.5%. It runs in two passes of 6 directions: the first pass is shown, then refined. The click probe searches 48 directions for its own number.
+- **Color:** log scale of J_min in N·s (F_min in N for pushes) between the 2nd and 98th percentiles, with a legend. Red is easy to flip, and neutral grey is hard. Blue-grey means "can't flip from here", and plain grey means "faces away from the hit".
+- **Probe:** clicking the bot raycasts in the worker, which has the full mesh, so the main thread never scans 2M triangles. It shows J_min, the pivot (a line for an edge, a dot for a corner), the landing pose, and the weapon verdict, or why nothing flips.
 
 ### 3.8 Mass properties input
 
@@ -309,6 +329,12 @@ Every reaction term scales with J, so validity doesn't depend on the impulse siz
   - the moments of inertia "taken at the center of mass and aligned with the output coordinate system" (Lxx through Lzz)
 
   Units are taken from the text, and decimal commas are accepted.
+
+  SolidWorks reports products of inertia in "positive tensor notation" (Lxy = +∫xy dm), so the inertia tensor's off-diagonal entries are −Lxy, −Lxz and −Lyz. The report's other two inertia blocks give a built-in self-check that catches a wrong sign or a bad paste:
+  - The tensor's eigenvalues must match the principal moments.
+  - The parallel-axis theorem must reproduce the block "taken at the output coordinate system".
+
+  The status line also shows the report's coordinate system, and any "includes hidden components" note.
 - **JSON sidecar.** Inertia is about the COM, in body axes. A future SolidWorks macro would write this file.
 
   ```json
@@ -330,44 +356,69 @@ Every reaction term scales with J, so validity doesn't depend on the impulse siz
 
 - The Mass Properties dialog and the STL export each have an output coordinate system option. Both must use the same one; the default is the model origin.
 - In the STL export options, tick "Do not translate STL output data to positive space".
+- Parts that never reach the outside, such as electronics and internal hardware, only need to be in the mass report. They can be hidden or missing in the STL, because only the outer shell affects the geometry. `test_1` is an example: its hidden internal components add weight to the report but are absent from the STL.
 
 ---
 
 ## 4. Performance
 
-**Target:** usable on a low-end laptop, such as an Intel N100 or Celeron-class machine. Assume one core of such a laptop is about 6× slower than the Apple M5 Pro used for the measurements. Verify this with Chrome DevTools CPU throttling set to 6×.
+**Target:** usable on a low-end laptop, such as an Intel N100 or Celeron-class machine. Assume one core of such a laptop is about 6× slower than the Apple M5 Pro used for the measurements.
+
+**How to check:** worker time with `pnpm bench` (Node) × 6, and main-thread behaviour with `pnpm ui-check --throttle 6`.
+
+Chrome's CPU throttling (CDP `Emulation.setCPUThrottlingRate`) did **not** slow the analysis worker in headless Chromium. A 6× throttled run of `test_1` loaded in 1.7 s, against 1.4 s unthrottled. So throttled browser runs only cover the main thread.
 
 ### 4.1 Measured
 
-These were measured in Node 26 on the M5 Pro, using a synthetic bot: filleted chassis, four tessellated tires, a weapon disc and internal clutter. The low-end column is the measurement × 6.
+**Real bot: `docs/test_1.STL`.** This is a full assembly exported as one binary STL: 93 MB, 1,857,305 triangles, 516 × 213 × 351 mm. It is about the most complex model we expect. The timings are from Node 26 on the M5 Pro (`pnpm bench docs/test_1.STL docs/test_1.txt`).
 
-| Step | Runs when | M5 Pro | Low-end (est.) |
+| Step | Runs when | M5 Pro | Low-end (×6) |
 |---|---|---|---|
-| Weld 0.95M-triangle soup to 474k vertices | load | 119 ms | ~0.7 s |
-| Hull of 474k vertices (gives 4,326 hull vertices, 5,122 faces) | load | 214 ms | ~1.3 s |
-| 100k hull support queries (hill climb from a cube-map seed) | basis for roll cost | 26 ms | ~0.16 s |
-| Heatmap, one direction, 474k vertices | hit settings change | 9 ms | ~55 ms |
-| Heatmap, worst of 24 directions, 474k vertices | hit settings change | 236 ms | ~1.4 s |
+| Parse binary STL | load | 22 ms | 0.13 s |
+| Weld to 735,556 vertices | load | 119 ms | 0.7 s |
+| Hull (346 vertices, 527 faces after merging) | load | 128 ms | 0.8 s |
+| Mesh moments | load | 11 ms | 0.07 s |
+| Display mesh (1.38M vertices) | load | 173 ms | 1.0 s |
+| **Total load** | load | **~455 ms** | **~2.7 s** |
+| Equilibria, destination table, barriers | COM or threshold change | 12 ms | 0.07 s |
+| Basins at level 4 / 6 / 7 | COM or threshold change | 4 / 28 / 106 ms | 0.02 / 0.17 / 0.64 s |
+| Pivot models for one pose | pose or mass change | 4 ms | 0.03 s |
+| Heatmap, one direction | hit settings or camera change | 36 ms | 0.22 s |
+| Heatmap, worst direction: pass 1, then pass 2 | hit settings change | 333 ms, then 321 ms | 2.0 s, then 1.9 s |
 
-### 4.2 Estimated (benchmarks arrive in M2)
+In the browser (headless Chromium with software WebGL, at 1440 × 900):
+- From choosing `test_1.STL` to the model on screen: 1.4 s.
+- From pasting the report to the pose list: 2.6 s. This includes a 150 ms debounce and two software renders of 2M triangles.
+- Heatmap: 0.9 s.
+- The sample bot is under 0.5 s end to end.
 
-| Step | M5 Pro | Low-end |
+With the COM from `docs/test_1.txt`:
+- The COM sits 59.7 mm inside the hull.
+- The raw counts are 7 stable faces, 13 saddles and 8 maxima, so Poincaré–Hopf passes (7 − 13 + 8 = 2).
+- Folding at 0.5 mm leaves two poses, A (57%) and B (43%). Both rest on triangular support faces whose nearest edge is not a saddle.
+
+**Synthetic bot** (measured before implementation): a filleted chassis, four tires tessellated at 1024 segments, a weapon disc and internal clutter. This is the stress case for the hull, because curved outer surfaces add hull vertices.
+
+| Step | M5 Pro | Low-end (×6) |
 |---|---|---|
-| Parse a 1M-triangle binary STL | ~50 ms | ~0.3 s |
-| Equilibria, destination table and barriers | < 10 ms | < 60 ms |
-| Basins at level 6 (41k samples) using the destination table | ~20–40 ms | ~0.15–0.25 s |
-| Roll path for the animation | < 1 ms | < 5 ms |
+| Weld 0.95M-triangle soup to 474k vertices | 119 ms | ~0.7 s |
+| Hull of 474k vertices (4,326 hull vertices, 5,122 faces) | 214 ms | ~1.3 s |
+| 100k hull support queries (hill climb from a cube-map seed) | 26 ms | ~0.16 s |
 
-### 4.3 Budgets (at 6× throttle)
+### 4.2 Budgets (low-end estimate)
 
-- **Load a 1M-triangle STL:** 3 s or less, with progress shown.
-- **COM edit to updated pose list:** 300 ms or less. Coarse basins come first and are refined within 1 s.
-- **Heatmap:** 100 ms or less for a single direction. 2 s or less for worst-direction, with progress shown.
-- **Main thread:** no task over 50 ms. Render only on demand (no idle render loop), and cap the pixel ratio at 2.
+| Budget | Target | Estimate on `test_1` |
+|---|---|---|
+| Load, with progress shown | ≤ 3 s | ~2.7 s ✓ |
+| COM edit to updated pose list (coarse first, refined within 1 s) | ≤ 0.3 s | ~0.1 s coarse, ~0.25 s refined ✓ |
+| Heatmap, one direction | ≤ 0.1 s | ~0.22 s ✗ (corner pivots roughly doubled the kernel cost) |
+| Heatmap, worst direction, first paint (with progress) | ≤ 2 s | ~2.0 s, refined by ~3.9 s (borderline) |
+| Main thread: no task over 50 ms; render on demand only; pixel ratio capped at 2 | | Implemented; not yet profiled on slow hardware |
 
-### 4.4 Risks
+### 4.3 Risks
 
-- **GPU:** old integrated graphics drawing 1M+ triangles hasn't been measured. The fallback is a decimated display mesh.
+- **GPU:** drawing 2M triangles on old integrated graphics hasn't been measured. Headless Chromium renders in software, so it can't tell us. The fallback is a decimated display mesh.
+- **Heatmap kernel cost:** the next steps, if needed, are to skip vertices that no hit can reach (internal parts) or to split the work across more workers.
 - **Very fine hulls:** more than 20k hull vertices would slow the vertex pivots.
 
 ---
@@ -385,31 +436,32 @@ These were measured in Node 26 on the M5 Pro, using a synthetic bot: filleted ch
 │ ▸ View settings         │                                            │
 │─────────────────────────│               3D viewport                  │
 │ Poses           check ✓ │                                            │
-│ ■ Upright    62%  1.6 J │                                            │
-│ ■ Inverted   31%  2.1 J │                                            │
-│ ■ Left side   7%  0.4 J │                                   legend   │
+│ ■ Pose A     62%  1.6 J │                                            │
+│ ■ Pose B     31%  2.1 J │                                            │
+│ ■ Pose C      7%  0.4 J │                                   legend   │
 │   (selected pose detail)│                                            │
 └─────────────────────────┴────────────────────────────────────────────┘
 ```
 
 **Responsive rules:**
 
-- **960 px wide or more:** two columns. The panel is `clamp(280px, 24vw, 360px)` wide and the viewport fills the rest.
+- **960 px wide or more:** two columns. The panel is `clamp(280px, 26vw, 370px)` wide and the viewport fills the rest.
   - The panel scrolls on its own, and its sections collapse, so a 1366 × 768 screen fits without the page scrolling.
-- **Under 960 px** (for example, a half-screen window): the layout stacks, with the viewport on top at 55vh and the panel below it.
+- **Under 960 px** (for example, a half-screen window): the layout stacks, with the viewport on top at 58vh and the panel below it.
+- Checked with `pnpm ui-check` at 1280 × 720, 1366 × 768, 1440 × 900, 1920 × 1080 and 900 × 800, in light and dark themes.
 
 **Styling:** system font, 14 px base, light and dark themes via `prefers-color-scheme`. No UI library.
 
 ### 5.2 Panel
 
-- **Model:** file name, triangle count, units, up axis and front axis. The up axis defaults to +Y, SolidWorks' default. The axes drive pose names and the initial camera.
+- **Model:** file name, triangle count and units. There is no up or front axis to set (§2.2). The Model and Mass properties sections collapse once the first analysis succeeds; their summaries stay visible.
 - **Mass properties:** a paste box (the primary input), JSON and manual fields. A status line shows which values are in use and any sanity warnings.
 - **View settings** change with the active tab:
-  - **Basins:** show saddles, high precision.
-  - **Hits:** impulse or push, elevation, a fixed azimuth or worst direction, μ (default 0.5), e (default 0.3), and the weapon calculator.
+  - **Basins:** high precision.
+  - **Hits:** impulse or push, from-camera or worst direction, elevation, μ (default 0.5), e (default 0.3), and the weapon calculator.
 - **Pose list (always visible).** Each row shows:
   - a color swatch, matching the basin shell
-  - a name, generated (Upright, Inverted, Nose down, Left side, and so on) and editable
+  - a letter (Pose A is the most likely, then B, and so on)
   - the probability
   - the escape barrier in J, with the COM lift in mm
   - the tilt-to-tip angle
@@ -419,12 +471,12 @@ These were measured in Node 26 on the M5 Pro, using a synthetic bot: filleted ch
 
 ### 5.3 Views
 
-- **Poses:** the bot rests in the selected pose on a ground grid. A COM marker drops a line to the ground, and the support polygon is outlined on the ground. A hull overlay is optional.
-- **Basins:** the bot is shown in its modelled orientation inside a translucent shell colored by destination pose.
+- **Poses:** the bot rests in the selected pose on a ground grid. A COM marker drops a line to the ground, and the support polygon is outlined on the ground.
+- **Basins:** the bot is shown in the selected pose inside a translucent shell colored by destination pose. The shell turns with the bot.
   - A point on the shell in body direction `u` means "if this side faces the floor".
   - Clicking a point turns that side down and rolls the bot to rest. A scrub bar replays the roll.
 - **Hits:** the bot rests in the selected pose, painted with the J_min heatmap, with a legend.
-  - Hovering shows J_min, the pivot edge (highlighted) and the landing pose, or why the bot doesn't pivot. Clicking pins the readout.
+  - Clicking shows J_min, the pivot (an edge as a line, a corner as a dot) and the landing pose, or why the bot doesn't pivot. The readout refreshes when the hit settings change. There is no hover readout: the raycast runs in the worker and takes tens of milliseconds on 2M triangles.
   - The weapon calculator compares the impulse delivered at the pinned point with J_min there.
 
 **Empty state:** a drop zone and a "Try the sample bot" button, which loads a generated four-wheel wedge so the app can be explored without a model.
@@ -433,42 +485,56 @@ These were measured in Node 26 on the M5 Pro, using a synthetic bot: filleted ch
 
 ## 6. Testing
 
-**Unit tests** (Vitest, `src/core`):
+**Unit tests** (`pnpm test`, Vitest, `src/core`), 25 in total:
 
-- Cube and box: 6 stable faces, 12 saddles and 8 maxima, Poincaré–Hopf passes, and probabilities are symmetric.
-- Regular tetrahedron.
-- Box with an off-center COM: poses disappear as the COM moves past an edge.
-- A triangulated flat face merges back into one polygon.
-- The notes' §6.3 worked example: I_a = 0.0424, a 1.64 J barrier, 6.2 and 1.2 N·s, μ ≈ 3.3 and 0.65.
-- The per-endpoint check rejects an off-center hit that lifts one end of the edge.
-- Tessellated tire wells disappear under the 0.5 mm threshold.
-- The SolidWorks report parser on real pasted samples.
+- **Hull:** a box with triangulated faces merges back to 6 quads, 8 vertices and 12 edges.
+- **Equilibria:**
+  - A cube gives 6 stable faces, 12 saddles and 8 maxima; a regular tetrahedron gives 4, 6 and 4.
+  - A prism with an obtuse corner loses its base pose once the COM passes the edge.
+  - Poincaré–Hopf holds for 50 random interior COMs.
+- **Rolling and basins:**
+  - Icosphere weights sum to 1, and levels nest.
+  - A cube lands on each face 1/6 of the time; probabilities sum to 1.
+  - Every recorded roll segment lowers the COM.
+- **Barriers:**
+  - A box's escape barrier is the lift over its nearest edge.
+  - Shallow wells fold into their cheapest exit.
+- **Hits:**
+  - The notes' §6.3 example: I_a = 0.042432, a 1.64 J barrier, 6.218 and 1.2436 N·s, sliding below μ ≈ 3.3 and 0.65.
+  - An upward hit at a back corner lifts one end of the far edge.
+  - The landing pose is the end face.
+  - A corner pivot picks up the off-centre hit.
+  - The heatmap kernel agrees with the per-point evaluation on 200 random hits, for impact and push.
+  - On a rounded corner, impact losses shrink as the facets get finer, ending within 5% of lossless at 32 facets.
+- **Input:**
+  - The SolidWorks report parser reads SI values with negated products and passes both self-checks, and it rejects a paste whose products have the wrong sign.
+  - The JSON format, binary and ASCII STL, and OBJ quads all parse.
+- **`test_1`, when its files are present locally:** with the report's COM, the raw counts are 7 stable faces, 13 saddles and 8 maxima. Test models (`docs/test_*`) are gitignored, so this test skips when the files are absent.
 
-**Property tests:**
+**Not yet covered:**
+- A tessellated-tire test for the 0.5 mm folding threshold.
+- Manual cross-checks of stable poses against trimesh `compute_stable_poses(center_mass=…)` and `drop_probs --com`, using the dice models from the SIGGRAPH project page.
 
-- Poincaré–Hopf holds on random convex polytopes with a random interior COM.
-- Probabilities sum to 1.
-- Every roll strictly decreases h.
+**Bench:**
+- `pnpm bench [model.stl report.txt]` times every pipeline stage in Node (§4).
+- `pnpm ui-check <out-dir> [--dev] [--throttle 6] [--dark] [--sizes …] [--model … --mass …]` drives the app in headless Chromium. It loads the model, takes screenshots of every view, sets a 45° rising hit, probes the bot, and clicks the basin shell to watch a roll.
+  - By default it runs the production build. `--dev` runs it against the dev server instead, where React's StrictMode runs effects twice; run it both ways.
 
-**Manual cross-checks:** compare stable poses with trimesh `compute_stable_poses(center_mass=…)` and `drop_probs --com`, using the dice models from the SIGGRAPH project page.
-
-**Bench** (`bench/`, run with Node): reproduces the §4 tables on synthetic bots.
-
-quickhull3d's ESM build uses extensionless imports. Vite and Vitest resolve them, but plain Node doesn't, so bench scripts import `quickhull3d/dist/quickhull3d.js` directly.
+quickhull3d's ESM build uses extensionless imports. Vite and Vitest resolve them, but plain Node doesn't, so core imports `quickhull3d/dist/quickhull3d.js` directly (typed in `src/core/quickhull3d.d.ts`).
 
 ---
 
 ## 7. Milestones
 
-| # | Milestone | Done when |
-|---|---|---|
-| M0 | **Scaffold:** strip the template, add dependencies and Vitest, build the layout shell (header, panel, viewport, responsive rules), and set up worker plumbing with progress and superseding. | The empty app renders cleanly at 1280 × 720 and 1920 × 1080, and a worker round trip works. |
-| M1 | **Load and view:** STL and OBJ parsing and welding in the worker, units and axes, a viewer with orbit controls and on-demand rendering, mass properties (paste, JSON, manual) with sanity checks, a hull overlay, and the sample bot. | A 1M-triangle STL loads within budget, and a pasted report fills in mass, COM and inertia. |
-| M2 | **Statics:** polygon hull, equilibria, Poincaré–Hopf check, rolling with the destination table, streamed icosphere basins, the pose list, the Poses and Basins views, and the click-to-roll animation. | Unit tests pass, and a COM edit updates the poses within budget. |
-| M3 | **Barriers:** saddle graph, merge tree, simplification threshold, escape barrier and cheapest exit, energy to reach each pose, inset and tilt-to-tip. | The tire-well and box tests pass. |
-| M4 | **Hits:** inertia (given or estimated), per-edge precompute, J_min with per-endpoint checks, the heatmap (fixed and worst direction), the probe readout, push mode and the weapon calculator. | The §6.3 example test passes, and the heatmap is within budget. |
-| M5 | **Polish:** a pass at 6× throttle, help text for every number, error states, README and deployment. | Every budget is met at 6× throttle. |
-| v1.x | Merge-tree diagram, Rapier verify sim, configuration comparison. | |
+| # | Milestone | Done when | Status |
+|---|---|---|---|
+| M0 | **Scaffold:** strip the template, add dependencies and Vitest, build the layout shell (header, panel, viewport, responsive rules), and set up worker plumbing with progress and superseding. | The empty app renders cleanly at 1280 × 720 and 1920 × 1080, and a worker round trip works. | Done |
+| M1 | **Load and view:** STL and OBJ parsing and welding in the worker, units and axes, a viewer with orbit controls and on-demand rendering, mass properties (paste, JSON, manual) with sanity checks, a hull overlay, and the sample bot. | `test_1.STL` loads within budget, and a pasted report fills in mass, COM and inertia. | Done, without the hull overlay; there are no units or axes to set beyond file units |
+| M2 | **Statics:** polygon hull, equilibria, Poincaré–Hopf check, rolling with the destination table, streamed icosphere basins, the pose list, the Poses and Basins views, and the click-to-roll animation. | Unit tests pass, and a COM edit updates the poses within budget. | Done |
+| M3 | **Barriers:** saddle graph, merge tree, simplification threshold, escape barrier and cheapest exit, energy to reach each pose, inset and tilt-to-tip. | The tire-well and box tests pass. | Done; the tire-well test is still missing |
+| M4 | **Hits:** inertia (given or estimated), per-edge precompute, J_min with per-endpoint checks, the heatmap (fixed and worst direction), the probe readout, push mode and the weapon calculator. | The §6.3 example test passes, and the heatmap is within budget. | Done, plus corner pivots; the single-direction heatmap is over budget (§4.2) |
+| M5 | **Polish:** a pass at 6× throttle, help text for every number, error states, README and deployment. | Every budget is met at 6× throttle. | Partly: help, error states, README and `ui-check` are done; deployment and a real low-end laptop check are not |
+| v1.x | Merge-tree diagram, Rapier verify sim, configuration comparison. | | Not started |
 
 **Rough effort:** M0 half a day, M1 a day, M2 two to three days, M3 a day, M4 two days, M5 a day.
 
@@ -476,10 +542,10 @@ quickhull3d's ESM build uses extensionless imports. Vite and Vitest resolve them
 
 ## 8. Open questions
 
-- **Products of inertia:** what sign convention does the SolidWorks report use for Lxy and the other off-diagonal terms? Confirm with an asymmetric test part before trusting them.
-- **Test inputs:** a real pasted Mass Properties report (for the parser) and one real bot STL (for tests and the bench).
 - **Hosting:** GitHub Pages or Cloudflare Pages. This sets Vite's `base` path.
-- **Defaults for μ and e:** the current values are placeholders until we have arena numbers.
+- **Default μ and e** are placeholders (0.5 and 0.3). At μ = 0.5, most hits on low bots slide rather than tip. That matches the notes for metal on steel, but is pessimistic for a bot resting on rubber tires.
+- **Validating corner pivots:** the corner model is the least checked part of the hit model. The v1.x Rapier sim is the way to check it.
+- **GPU on old laptops** (§4.3).
 
 ---
 
@@ -492,6 +558,18 @@ quickhull3d's ESM build uses extensionless imports. Vite and Vitest resolve them
 | 2026-10-31 | Icosphere samples instead of a Fibonacci sphere | The icosphere doubles as the shell's display mesh, and its nested levels allow streamed refinement. |
 | 2026-10-31 | Per-face destination table | It bounds the cost of each sample roll on finely tessellated hulls. |
 | 2026-10-31 | Simplify poses by depth instead of merging facets | It works at any tessellation, and each fold removes a stable–saddle pair, so the Poincaré–Hopf count stays consistent. |
-| 2026-10-31 | Planar tip path for hit energy | r_e − h0 is wrong whenever the support edge isn't a saddle, which is the normal case for wheeled bots. |
+| 2026-10-31 | Planar tip path for hit energy | r_e − h0 is wrong whenever the support edge isn't a saddle, which is the normal case for wheeled bots. Confirmed on `test_1`: the nearest edge of both the upright and the inverted support face isn't a saddle. |
 | 2026-10-31 | Per-endpoint reaction check | A check on the total reaction misses off-center hits that lift one end of the edge. |
 | 2026-10-31 | Paste the SolidWorks Mass Properties report instead of writing a macro for v1 | It gives the same numbers with nothing to install or maintain. |
+| 2026-10-31 | Merge hull faces by distance to a plane, not by angle | Angle-based merging accepted faces that weren't flat and gave `test_1` a fake ninth peak. |
+| 2026-10-31 | Separate display mesh with crease splits and long-edge splits | Per-vertex values on welded CAD meshes smeared across sharp edges, and flat faces had only corner samples. |
+| 2026-10-31 | Corner pivots alongside edge pivots | Off-centre hits, which are most hits, lift one end of every edge; without corners the heatmap was mostly "not modelled". |
+| 2026-10-31 | Land tip paths by following the plane past the top | Rolling from rest just past the top sent most of `test_1`'s paths back into their starting pose. |
+| 2026-10-31 | Worst direction: 12 azimuths in two passes, no refinement, computed once per shared position | It roughly halved the cost and gives a first paint in about 2 s at 6×. The error at the optimum is at most 3.5%. |
+| 2026-10-31 | Click to probe, not hover | The raycast over 2M triangles runs in the worker and takes tens of milliseconds, too slow to follow the mouse on slow machines. |
+| 2026-10-31 | Plain React state in `App.tsx`, no reducer or state library | The app is small; one component owns the state and the effects that sync it to the worker and viewer. |
+| 2026-11-01 | The analysis worker starts on first use; `dispose()` only stops it | StrictMode's mount, unmount, remount in development terminated an eagerly created worker, so `pnpm dev` hung at "Reading file". The production build was unaffected, which is why the build-only UI check missed it. |
+| 2026-10-31 | Playwright as a dev dependency | It gives repeatable screenshots at laptop sizes and both themes, plus browser timings. |
+| 2026-10-31 | Orientation-independent UI: no up or front axis | User requirement. Poses get letters, display yaw comes from the hull's PCA, and hit directions come from the camera. |
+| 2026-10-31 | Plastic impacts at contact changes along the tip path | This replaces "lossless plus a warning flag": it costs little and is exact for the planar model, and losses vanish as tessellation gets finer. |
+| 2026-10-31 | Negate SolidWorks products of inertia | The report uses positive tensor notation. Checked on `test_1.txt`: with negated products the eigenvalues match the principal moments, and the parallel-axis theorem reproduces the origin block (Ixy 2,882,563 vs 2,882,566 reported; with the other sign it would be −1,264,302). |

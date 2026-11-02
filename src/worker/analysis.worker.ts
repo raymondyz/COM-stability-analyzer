@@ -3,18 +3,18 @@ import { displayMesh, type DisplayMesh } from '../core/displayMesh.ts'
 import { classify, type Statics } from '../core/equilibria.ts'
 import { heatRange, PASSES, worstDirection, type HeatSpec } from '../core/heatmap.ts'
 import { buildHull, type Hull } from '../core/hull.ts'
-import { bestPivot, cornerModels, edgeModels, weaponImpulse, type Pivots } from '../core/impact.ts'
+import { bestPivot, cornerModels, edgeModels, hitPath, weaponImpulse, type Pivots } from '../core/impact.ts'
 import { centroid, hullMoments, inertiaFromMoments, meshMoments, type Moments } from '../core/inertia.ts'
 import { parseObj } from '../core/io/obj.ts'
 import { parseStl } from '../core/io/stl.ts'
 import { makeRoller, resolve, rollFrom, type Roller, type Segment } from '../core/roll.ts'
 import { sampleBot } from '../core/sample.ts'
 import { icosphere, vertexCount } from '../core/sphere.ts'
-import { tipPath } from '../core/tipPath.ts'
+import { tipPath, tumble } from '../core/tipPath.ts'
 import type { MassProps } from '../core/types.ts'
-import { cross, dot, get, normalize, scale, sub, type Vec3 } from '../core/vec.ts'
+import { add, cross, dot, get, normalize, scale, sub, type Vec3 } from '../core/vec.ts'
 import { weld } from '../core/weld.ts'
-import type { AnalysisResult, HitSpec, LoadResult, PoseInfo, ProbeResult, Request, Response, RollResult } from './protocol.ts'
+import type { AnalysisResult, HitSpec, LoadResult, PickResult, PoseInfo, ProbeResult, Request, Response, RollResult } from './protocol.ts'
 
 interface Model {
   display: DisplayMesh        // drawn, painted and picked
@@ -49,6 +49,7 @@ self.onmessage = async (ev: MessageEvent<Request>) => {
     else if (req.kind === 'analyze') await analyze(req)
     else if (req.kind === 'roll') roll(req)
     else if (req.kind === 'heatmap') await heatmap(req)
+    else if (req.kind === 'pick') pick(req)
     else probe(req)
   } catch (e) {
     if (e === CANCELLED) post({ id: req.id, type: 'cancelled' })
@@ -221,20 +222,22 @@ function roll(req: Extract<Request, { kind: 'roll' }>) {
   post({ id: req.id, type: 'result', data })
 }
 
+const inertiaOf = (cur: Current, mass: MassProps) => mass.inertia ?? inertiaFromMoments(model!.moments, cur.com, mass.mass)
+const toPose = (cur: Current, f: number) => (f >= 0 ? cur.poseOfFace.get(f) ?? -1 : -1)
+
 // Edge and corner pivots for a pose, with landing faces mapped to pose indices.
 function pivotsFor(cur: Current, pose: number, mass: MassProps): Pivots {
   const key = `${cur.version}|${pose}|${mass.mass}|${mass.inertia?.join(',') ?? 'est'}`
   const hit = pivotCache.get(key)
   if (hit) return hit
-  const inertia = mass.inertia ?? inertiaFromMoments(model!.moments, cur.com, mass.mass)
+  const inertia = inertiaOf(cur, mass)
   const face = cur.stableFaces[cur.simp.poses[pose]]
-  const toPose = (f: number) => (f >= 0 ? cur.poseOfFace.get(f) ?? -1 : -1)
   const { hull } = model!
   const pv: Pivots = {
-    edges: edgeModels(hull, cur.st, cur.roller, face, mass, inertia).map((e) => ({ ...e, landing: toPose(e.landing) })),
+    edges: edgeModels(hull, cur.st, cur.roller, face, mass, inertia).map((e) => ({ ...e, landing: toPose(cur, e.landing) })),
     corners: cornerModels(hull, cur.st, cur.roller, face, mass, inertia).map((c) => ({
       ...c,
-      samples: c.samples.map((s) => ({ ...s, landing: toPose(s.landing) })),
+      samples: c.samples.map((s) => ({ ...s, landing: toPose(cur, s.landing) })),
     })),
   }
   pivotCache.set(key, pv)
@@ -272,42 +275,74 @@ async function heatmap(req: Extract<Request, { kind: 'heatmap' }>) {
   post({ id: req.id, type: 'result', data: out }, [out.buffer])
 }
 
-function probe(req: Extract<Request, { kind: 'probe' }>) {
-  const cur = needCurrent(req.version)
-  const hitTri = raycast(model!.display, req.ray.origin, normalize(req.ray.dir))
-  if (!hitTri) {
-    post({ id: req.id, type: 'result', data: null })
-    return
-  }
-  const pv = pivotsFor(cur, req.pose, req.mass)
-  const spec = heatSpec(cur, req.pose, req.mass, req.hit)
-  const p = sub(hitTri.point, cur.com)
+// The point on the model under a click, in body coordinates.
+function pick(req: Extract<Request, { kind: 'pick' }>) {
+  if (!model) throw CANCELLED
+  const hitTri = raycast(model.display, req.ray.origin, normalize(req.ray.dir))
   // Face the surface normal toward the ray, so the "hits push in" test uses the visible side.
-  const normal = dot(hitTri.normal, req.ray.dir) > 0 ? scale(hitTri.normal, -1) : hitTri.normal
-  const d = worstDirection(pv, req.pose, spec, p, normal)
-  let data: ProbeResult = { point: hitTri.point, dir: d, value: null, reason: 'none', pivot: null, landing: null, delivered: null }
-  if (d && dot(d, normal) < 0) {
-    const res = bestPivot(pv, req.pose, p, d, req.hit.mu, req.hit.mode, req.mass.mass)
-    if (res.best) {
-      const b = res.best
-      const pivot: ProbeResult['pivot'] = b.kind === 'edge'
-        ? { kind: 'edge', a: pv.edges[b.index].q1, b: get(cur.st.V, pv.edges[b.index].b) }
-        : { kind: 'corner', a: pv.corners[b.index].P, b: pv.corners[b.index].P }
-      data = {
-        ...data,
-        value: b.value,
-        reason: 'ok',
-        pivot,
-        landing: b.landing,
-        delivered: req.weapon && req.hit.mode === 'impulse'
-          ? weaponImpulse(b.mEff, req.weapon.mass, req.weapon.speed, req.weapon.restitution)
-          : null,
-      }
-    } else {
-      data = { ...data, reason: res.reason }
-    }
+  const data: PickResult | null = hitTri && {
+    point: hitTri.point,
+    normal: dot(hitTri.normal, req.ray.dir) > 0 ? scale(hitTri.normal, -1) : hitTri.normal,
   }
   post({ id: req.id, type: 'result', data })
+}
+
+// A hit of a given strength at a placed point: what it takes to tip the bot out of
+// its pose there, and where this hit sends it.
+function probe(req: Extract<Request, { kind: 'probe' }>) {
+  const cur = needCurrent(req.version)
+  const pv = pivotsFor(cur, req.pose, req.mass)
+  const spec = heatSpec(cur, req.pose, req.mass, req.hit)
+  const p = sub(req.point, cur.com)
+  const d = worstDirection(pv, req.pose, spec, p, req.normal)
+  const data: ProbeResult = { point: req.point, dir: d, value: null, reason: 'none', pivot: null, landing: null, applied: null, result: null }
+  const done = () => post({ id: req.id, type: 'result', data })
+  if (!d || dot(d, req.normal) >= 0) {
+    data.reason = 'away'
+    return done()
+  }
+  const res = bestPivot(pv, req.pose, p, d, req.hit.mu, req.hit.mode, req.mass.mass)
+  if (!res.best) {
+    data.reason = res.reason
+    return done()
+  }
+  const b = res.best
+  const { hull } = model!
+  const face = cur.stableFaces[cur.simp.poses[req.pose]]
+  const n = hull.faces[face].normal
+  const mass = req.mass.mass
+  const hp = hitPath(pv, b, cur.st.V, hull.count, n, cur.st.faceHeight[face], p, d, inertiaOf(cur, req.mass), mass)
+  const along = (t: number) => normalize(add(scale(n, Math.cos(t)), scale(hp.m, Math.sin(t))))
+  const s = req.strength
+  const applied = s.kind === 'weapon' ? weaponImpulse(b.mEff, s.mass, s.speed, s.restitution) : s.value
+  data.reason = 'ok'
+  data.value = hp.value
+  data.pivot = b.kind === 'edge'
+    ? { kind: 'edge', a: pv.edges[b.index].q1, b: get(cur.st.V, pv.edges[b.index].b) }
+    : { kind: 'corner', a: pv.corners[b.index].P, b: pv.corners[b.index].P }
+  data.landing = toPose(cur, rollFrom(cur.roller, along(hp.path.land)))
+  data.applied = applied
+
+  // A push short of F_min doesn't tip the bot over at all.
+  const t = req.hit.mode === 'push'
+    ? applied >= hp.value ? tumble(cur.st.V, hull.count, n, hp.m, hp.start, hp.IGa, mass, 'push') : null
+    : tumble(cur.st.V, hull.count, n, hp.m, hp.start, hp.IGa, mass, applied * hp.spinPerJ)
+  const segments: Segment[] = (t?.steps ?? [])
+    .filter((st) => st.to !== st.from)
+    .map((st) => ({ kind: 'pivot', point: get(cur.st.V, st.vertex), from: along(st.from), to: along(st.to) }))
+  let pose = req.pose
+  if (t && !t.complete) pose = -1
+  else if (t && t.rest !== 0) pose = toPose(cur, rollFrom(cur.roller, along(t.rest), segments))
+  data.result = {
+    pose,
+    tops: t?.tops ?? 0,
+    maxTilt: t?.maxTilt ?? 0,
+    energy: req.hit.mode === 'impulse' ? (applied * applied) / (2 * b.mEff) : null,
+    hardest: t?.hardest ?? 0,
+    complete: t?.complete ?? true,
+    segments,
+  }
+  done()
 }
 
 // Nearest triangle hit along a ray (Möller–Trumbore), in body coordinates.

@@ -73,14 +73,21 @@ for (const [w, h] of sizes) {
   await page.screenshot({ path: join(out, `${tag}-3-hits.png`) })
 
   // A rising hit (elevation 45°, in 5° steps), then click the middle of the viewport to probe it.
-  await page.locator('.slider input').first().focus()
+  await page.locator('.slider:has-text("Elevation") input').focus()
   for (let i = 0; i < 9; i++) await page.keyboard.press('ArrowRight')
   await page.waitForTimeout(1500)
-  console.log(`[${tag}] elevation now: ${await page.locator('.slider output').first().textContent()}`)
+  console.log(`[${tag}] elevation now: ${await page.locator('.slider:has-text("Elevation") output').textContent()}`)
   const box = (await page.locator('.canvas').boundingBox())!
   await page.mouse.click(box.x + box.width * 0.5, box.y + box.height * 0.55)
   await page.waitForTimeout(1500)
   await page.screenshot({ path: join(out, `${tag}-4-hits-probe.png`) })
+  console.log(`[${tag}] hit card: ${(await page.locator('.probe').innerText().catch(() => 'none')).replace(/\s*\n\s*/g, ' | ')}`)
+  const show = page.locator('.probe .show')
+  if (await show.count()) {
+    await show.click()
+    await page.waitForTimeout(1500)
+    await page.screenshot({ path: join(out, `${tag}-4b-hits-motion.png`) })
+  }
 
   // Drop it from a point near the top of the shell and let it roll.
   await page.click('.tabs button:has-text("Basins")')

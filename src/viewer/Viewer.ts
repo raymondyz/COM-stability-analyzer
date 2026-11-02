@@ -20,7 +20,7 @@ export interface ProbeDisplay {
 }
 
 interface Step {
-  kind: 'turn' | 'seg'
+  kind: 'turn' | 'fall' | 'seg'
   start: number
   duration: number
   q0: THREE.Quaternion
@@ -28,19 +28,23 @@ interface Step {
   axis: THREE.Vector3          // seg only, body frame
   angle: number
   pivot: THREE.Vector3         // seg only, body frame relative to the COM
-  anchor: THREE.Vector3        // seg: world position of the pivot; turn: starting COM position
+  anchor: THREE.Vector3        // seg: world position of the pivot; turn and fall: starting COM position (turns end centred)
+  z1: number                   // turn and fall: final COM height
 }
 
 const DOWN = new THREE.Vector3(0, 0, -1)
+const OUT = new THREE.Vector3(0, 0, 1)
 const v3 = (a: Vec3) => new THREE.Vector3(a[0], a[1], a[2])
 const TURN_SPEED = 2.5   // rad/s
+const HOLD = 0.2         // s, pause on the shell before the drop
+const FALL_TIME = 0.35   // s
 const ROLL_SPEED = 1.4   // rad/s
+const AIM_PX = 32        // hover marker size on screen when seen face-on, CSS px
 
 // Three.js scene for the bot. Renders only when something changes.
 export class Viewer {
   onShellClick?: (down: Vec3) => void
   onBodyClick?: (ray: { origin: Vec3, dir: Vec3 }) => void
-  onCameraSettled?: () => void
   onAnimTime?: (t: number, total: number) => void
 
   private renderer: THREE.WebGLRenderer
@@ -53,6 +57,7 @@ export class Viewer {
   private shell: THREE.Mesh<THREE.BufferGeometry, THREE.MeshBasicMaterial> | null = null
   private shellLevel = -1
   private grid: THREE.GridHelper | null = null
+  private gridStep = 1
   private comMarker: THREE.Mesh
   private dropLine: THREE.Line
   private support: THREE.LineLoop
@@ -60,6 +65,8 @@ export class Viewer {
   private probeMarker: THREE.Mesh
   private pivotMarker: THREE.Mesh
   private arrow: THREE.ArrowHelper
+  private aim: THREE.Mesh                  // marker where the pointer meets the basin shell
+  private aimAt: THREE.Vector2 | null = null           // pointer position while it hovers, in NDC
   private hull: Float64Array = new Float64Array()      // hull vertices relative to the COM
   private hullAbs: Float64Array = new Float64Array()
   private size = 1
@@ -69,6 +76,9 @@ export class Viewer {
   private hasPose = false
   private steps: Step[] = []
   private animTime = 0
+  private follow = false   // the floor moves instead of the bot (hits)
+  private arrowAt = new THREE.Vector3()
+  private slid = new THREE.Vector2()   // how far the floor has moved
   private playing = false
   private lastFrame = 0
   private raf = 0
@@ -125,10 +135,16 @@ export class Viewer {
     }
     this.arrow.renderOrder = 12
     this.scene.add(this.arrow)
+    this.aim = new THREE.Mesh(
+      new THREE.PlaneGeometry(1, 1),
+      new THREE.MeshBasicMaterial({ map: aimTexture(), transparent: true, depthTest: false, depthWrite: false, side: THREE.DoubleSide }),
+    )
+    this.aim.renderOrder = 6
+    this.aim.visible = false
+    this.scene.add(this.aim)
 
     this.controls = new OrbitControls(this.camera, this.renderer.domElement)
     this.controls.addEventListener('change', () => this.requestRender())
-    this.controls.addEventListener('end', () => this.onCameraSettled?.())
 
     const el = this.renderer.domElement
     el.addEventListener('pointerdown', (e) => (this.down = { x: e.clientX, y: e.clientY, t: performance.now() }))
@@ -136,7 +152,11 @@ export class Viewer {
       const d = this.down
       this.down = null
       if (d && Math.hypot(e.clientX - d.x, e.clientY - d.y) < 5 && performance.now() - d.t < 600) this.click(e)
+      this.hover(this.ndc(e))
     })
+    // The marker hides while a button is held, so it doesn't trail an orbit drag.
+    el.addEventListener('pointermove', (e) => this.hover(e.buttons ? null : this.ndc(e)))
+    el.addEventListener('pointerleave', () => this.hover(null))
 
     this.resize = new ResizeObserver(() => this.fitCanvas())
     this.resize.observe(container)
@@ -172,6 +192,7 @@ export class Viewer {
     const step = [1, 2, 5, 10].map((k) => k * pow).find((s) => s >= raw)!
     const span = Math.ceil(span0 / step) * step
     this.grid = new THREE.GridHelper(span, Math.round(span / step), '#8a8f98', '#8a8f98')
+    this.gridStep = step
     this.grid.rotateX(Math.PI / 2)
     const gm = this.grid.material as THREE.Material
     gm.transparent = true
@@ -267,7 +288,7 @@ export class Viewer {
 
   setMode(mode: ViewMode) {
     this.mode = mode
-    if (mode !== 'basins' && this.steps.length) this.resetToPose()
+    if (this.steps.length) this.resetToPose()
     this.applyMode()
     this.requestRender()
   }
@@ -336,40 +357,45 @@ export class Viewer {
   }
 
   // Shows a hit direction (body frame). With `at` (body frame) the arrow ends
-  // there; otherwise it ends at the bot's outline, aimed through the COM.
+  // there; otherwise it ends at the bot's outline, aimed through the COM. It is
+  // placed for the bot at rest in its pose, so it stays put while a hit plays out.
   setArrow(dir: Vec3 | null, at?: Vec3) {
     this.arrow.visible = !!dir
     if (dir) {
-      this.bot.updateMatrixWorld(true)
-      const d = v3(dir).applyQuaternion(this.bot.quaternion).normalize()
+      const d = v3(dir).applyQuaternion(this.poseQuat).normalize()
       const len = this.size * 0.3
+      const com = new THREE.Vector3(0, 0, this.poseHeight)
       let tip: THREE.Vector3
-      if (at) tip = v3(at).applyMatrix4(this.body.matrixWorld)
+      if (at) tip = v3(at).add(this.body.position).applyQuaternion(this.poseQuat).add(com)
       else {
         // How far the hull reaches toward where the hit comes from.
         let reach = 0
         for (let i = 0; i < this.hull.length; i += 3) reach = Math.max(reach, -(dir[0] * this.hull[i] + dir[1] * this.hull[i + 1] + dir[2] * this.hull[i + 2]))
-        tip = this.bot.position.clone().addScaledVector(d, -reach)
+        tip = com.addScaledVector(d, -reach)
       }
-      this.arrow.position.copy(tip).addScaledVector(d, -len)
+      this.arrowAt.copy(tip).addScaledVector(d, -len)
+      this.arrow.position.set(this.arrowAt.x - this.slid.x, this.arrowAt.y - this.slid.y, this.arrowAt.z)
       this.arrow.setDirection(d)
       this.arrow.setLength(len, len * 0.25, len * 0.12)
     }
     this.requestRender()
   }
 
-  // Horizontal direction away from the camera, tilted up by `elevation`, in the body frame.
-  cameraHitDirection(elevation: number): Vec3 {
-    const f = new THREE.Vector3().subVectors(this.controls.target, this.camera.position)
-    f.z = 0
-    if (f.lengthSq() < 1e-12) f.set(1, 0, 0)
-    f.normalize().multiplyScalar(Math.cos(elevation))
-    f.z = Math.sin(elevation)
-    f.applyQuaternion(this.bot.quaternion.clone().invert())
-    return [f.x, f.y, f.z]
+  // A hit direction in the body frame. It is set against the bot resting in its pose,
+  // as the viewport shows it: heading is the compass angle around the vertical (0°
+  // runs along the bot's length), and elevation tilts it up. Both in degrees.
+  bodyDirection(heading: number, elevation: number): Vec3 {
+    const h = THREE.MathUtils.degToRad(heading)
+    const e = THREE.MathUtils.degToRad(elevation)
+    const d = new THREE.Vector3(Math.cos(e) * Math.cos(h), Math.cos(e) * Math.sin(h), Math.sin(e))
+    d.applyQuaternion(this.poseQuat.clone().invert())
+    return [d.x, d.y, d.z]
   }
 
-  // Animates: turn so `down` faces the floor, then follow the recorded roll.
+  // Animates in three stages: turn so `down` faces the floor while rising until the
+  // shell rests on the floor at that point, drop onto the floor, then follow the
+  // recorded roll. The turn also brings the bot back to the middle of the floor, so
+  // drops always start centred however far earlier rolls took it.
   playRoll(down: Vec3, segments: Segment[]) {
     this.stop()
     const steps: Step[] = []
@@ -380,10 +406,32 @@ export class Viewer {
     const q1 = turn.multiply(q)
     const turnAngle = 2 * Math.acos(Math.min(1, Math.abs(q.dot(q1))))
     const tDur = Math.max(0.25, turnAngle / TURN_SPEED)
-    steps.push(this.step('turn', t, tDur, q, { q1, anchor: this.bot.position.clone() }))
-    t += tDur
-    let qc = q1.clone()
-    let pos = new THREE.Vector3(this.bot.position.x, this.bot.position.y, this.heightFor(qc))
+    steps.push(this.step('turn', t, tDur, q, { q1, anchor: this.bot.position.clone(), z1: this.shellRadius }))
+    t += tDur + HOLD
+    const pos = new THREE.Vector3(0, 0, this.heightFor(q1))
+    steps.push(this.step('fall', t, FALL_TIME, q1, { anchor: new THREE.Vector3(0, 0, this.shellRadius), z1: pos.z }))
+    this.start([...steps, ...this.pathSteps(segments, q1, pos, t + FALL_TIME)])
+  }
+
+  // Animates a hit playing out: from rest in the pose, along the recorded path.
+  // A hit can tumble the bot a long way, so the bot stays centred and the floor
+  // moves under it instead.
+  playPath(segments: Segment[]) {
+    this.stop()
+    const pos = new THREE.Vector3(0, 0, this.poseHeight)
+    this.follow = true
+    this.start(this.pathSteps(segments, this.poseQuat, pos, 0))
+  }
+
+  get animating() {
+    return this.steps.length > 0
+  }
+
+  // Steps that follow recorded segments, from orientation q and COM position pos at time t.
+  private pathSteps(segments: Segment[], q: THREE.Quaternion, pos: THREE.Vector3, t: number): Step[] {
+    const steps: Step[] = []
+    let qc = q.clone()
+    let pc = pos.clone()
     for (const s of segments) {
       const from = v3(s.from).normalize()
       const to = v3(s.to).normalize()
@@ -391,13 +439,17 @@ export class Viewer {
       if (angle < 1e-6) continue
       const axis = new THREE.Vector3().crossVectors(from, to).normalize()
       const pivot = v3(s.point)
-      const anchor = pivot.clone().applyQuaternion(qc).add(pos)
+      const anchor = pivot.clone().applyQuaternion(qc).add(pc)
       const dur = angle / ROLL_SPEED
       steps.push(this.step('seg', t, dur, qc, { axis, angle, pivot, anchor }))
       t += dur
       qc = qc.clone().multiply(new THREE.Quaternion().setFromAxisAngle(axis, -angle))
-      pos = anchor.clone().sub(pivot.clone().applyQuaternion(qc))
+      pc = anchor.clone().sub(pivot.clone().applyQuaternion(qc))
     }
+    return steps
+  }
+
+  private start(steps: Step[]) {
     this.steps = steps
     this.animTime = 0
     this.playing = true
@@ -447,14 +499,25 @@ export class Viewer {
   private step(kind: Step['kind'], start: number, duration: number, q0: THREE.Quaternion, extra: Partial<Step>): Step {
     return {
       kind, start, duration, q0: q0.clone(), q1: new THREE.Quaternion(), axis: new THREE.Vector3(), angle: 0,
-      pivot: new THREE.Vector3(), anchor: new THREE.Vector3(), ...extra,
+      pivot: new THREE.Vector3(), anchor: new THREE.Vector3(), z1: 0, ...extra,
     }
   }
 
   private stop() {
     this.steps = []
     this.playing = false
+    this.follow = false
+    this.slideFloor(0, 0)
     this.onAnimTime?.(0, 0)
+  }
+
+  // Moves the floor (and the hit arrow with it) as if the bot had moved by (x, y).
+  // The grid repeats every cell, so it only needs to shift by less than one.
+  private slideFloor(x: number, y: number) {
+    const wrap = (v: number) => v - this.gridStep * Math.round(v / this.gridStep)
+    this.slid.set(x, y)
+    this.grid?.position.set(-wrap(x), -wrap(y), 0)
+    this.arrow.position.set(this.arrowAt.x - x, this.arrowAt.y - y, this.arrowAt.z)
   }
 
   // COM height when resting with the current world-down direction (support function).
@@ -465,18 +528,30 @@ export class Viewer {
     return h
   }
 
+  // A time between two steps (the hold before the drop) finds the later step at k = 0.
   private applyAnim() {
     const t = this.animTime
     const s = this.steps.find((st) => t <= st.start + st.duration) ?? this.steps[this.steps.length - 1]
     if (!s) return
     const k = Math.min(1, Math.max(0, (t - s.start) / s.duration))
     if (s.kind === 'turn') {
+      // Rises as it turns, never dipping through the floor on the way, and glides
+      // back to the middle of the floor.
       const e = k * k * (3 - 2 * k)
       this.bot.quaternion.slerpQuaternions(s.q0, s.q1, e)
-      this.bot.position.set(s.anchor.x, s.anchor.y, this.heightFor(this.bot.quaternion))
+      const z = s.anchor.z + (s.z1 - s.anchor.z) * e
+      this.bot.position.set(s.anchor.x * (1 - e), s.anchor.y * (1 - e), Math.max(z, this.heightFor(this.bot.quaternion)))
+    } else if (s.kind === 'fall') {
+      // Accelerates like a drop.
+      this.bot.quaternion.copy(s.q0)
+      this.bot.position.set(s.anchor.x, s.anchor.y, s.anchor.z + (s.z1 - s.anchor.z) * k * k)
     } else {
       this.bot.quaternion.copy(s.q0).multiply(new THREE.Quaternion().setFromAxisAngle(s.axis, -k * s.angle))
       this.bot.position.copy(s.anchor).sub(s.pivot.clone().applyQuaternion(this.bot.quaternion))
+    }
+    if (this.follow) {
+      this.slideFloor(this.bot.position.x, this.bot.position.y)
+      this.bot.position.x = this.bot.position.y = 0
     }
     this.updateDropLine()
     this.onAnimTime?.(t, this.animDuration)
@@ -526,22 +601,56 @@ export class Viewer {
     this.requestRender()
   }
 
-  private click(e: PointerEvent) {
+  private ndc(e: PointerEvent): THREE.Vector2 {
     const rect = this.renderer.domElement.getBoundingClientRect()
-    const ndc = new THREE.Vector2(((e.clientX - rect.left) / rect.width) * 2 - 1, -((e.clientY - rect.top) / rect.height) * 2 + 1)
+    return new THREE.Vector2(((e.clientX - rect.left) / rect.width) * 2 - 1, -((e.clientY - rect.top) / rect.height) * 2 + 1)
+  }
+
+  // The visible point of the basin shell under `ndc`, as a unit direction from the
+  // COM in world axes, or null if the pointer misses the shell.
+  private shellHit(ndc: THREE.Vector2): THREE.Vector3 | null {
+    if (this.mode !== 'basins' || !this.shell?.visible) return null
+    this.camera.updateMatrixWorld()
+    const ray = new THREE.Raycaster()
+    ray.setFromCamera(ndc, this.camera)
+    const o = ray.ray.origin.clone().sub(this.bot.position)
+    const d = ray.ray.direction
+    const b = o.dot(d)
+    const disc = b * b - (o.lengthSq() - this.shellRadius ** 2)
+    if (disc < 0) return null
+    // The near side, or the far side when the camera is zoomed inside the shell.
+    const t = -b - Math.sqrt(disc) > 0 ? -b - Math.sqrt(disc) : -b + Math.sqrt(disc)
+    return t > 0 ? o.addScaledVector(d, t).normalize() : null
+  }
+
+  private hover(ndc: THREE.Vector2 | null) {
+    this.aimAt = ndc
+    this.requestRender()
+  }
+
+  // Runs before every frame, since orbiting, zooming and rolling all move the shell
+  // under a pointer that stays still.
+  private updateAim() {
+    const hit = this.aimAt && this.shellHit(this.aimAt)
+    this.aim.visible = !!hit
+    this.renderer.domElement.style.cursor = hit ? 'pointer' : ''
+    if (!hit) return
+    this.aim.position.copy(this.bot.position).addScaledVector(hit, this.shellRadius)
+    this.aim.quaternion.setFromUnitVectors(OUT, hit)
+    // Lies flat on the shell, sized to span AIM_PX at its distance from the camera, so
+    // it only shrinks where the shell turns away.
+    const dist = this.aim.position.distanceTo(this.camera.position)
+    this.aim.scale.setScalar((AIM_PX / this.container.clientHeight) * 2 * Math.tan(THREE.MathUtils.degToRad(this.camera.fov / 2)) * dist)
+  }
+
+  private click(e: PointerEvent) {
+    const ndc = this.ndc(e)
     const ray = new THREE.Raycaster()
     ray.setFromCamera(ndc, this.camera)
     this.scene.updateMatrixWorld(true)
-    if (this.mode === 'basins' && this.shell?.visible) {
-      // Ray against the shell's sphere, in the bot's COM-centred frame.
-      const inv = this.bot.matrixWorld.clone().invert()
-      const o = ray.ray.origin.clone().applyMatrix4(inv)
-      const d = ray.ray.direction.clone().transformDirection(inv)
-      const b = o.dot(d)
-      const c = o.lengthSq() - this.shellRadius ** 2
-      const disc = b * b - c
-      if (disc < 0) return
-      const hit = o.addScaledVector(d, -b - Math.sqrt(disc)).normalize()
+    const hit = this.shellHit(ndc)
+    if (hit) {
+      hit.applyQuaternion(this.bot.quaternion.clone().invert())
       this.onShellClick?.([hit.x, hit.y, hit.z])
     } else if (this.mode === 'hits') {
       const inv = this.body.matrixWorld.clone().invert()
@@ -563,7 +672,27 @@ export class Viewer {
         if (this.animTime >= this.animDuration) this.playing = false
         else this.requestRender()
       }
+      this.updateAim()
       this.renderer.render(this.scene, this.camera)
     })
   }
+}
+
+// The hover marker: an open accent ring with a thin white edge, so it reads on every
+// basin color and leaves the color under it visible.
+function aimTexture(): THREE.CanvasTexture {
+  const n = 128
+  const canvas = document.createElement('canvas')
+  canvas.width = canvas.height = n
+  const g = canvas.getContext('2d')!
+  g.arc(n / 2, n / 2, 0.375 * n, 0, 2 * Math.PI)
+  g.strokeStyle = '#ffffff'
+  g.lineWidth = 0.14 * n
+  g.stroke()
+  g.strokeStyle = '#1b6ef3'
+  g.lineWidth = 0.08 * n
+  g.stroke()
+  const tex = new THREE.CanvasTexture(canvas)
+  tex.colorSpace = THREE.SRGBColorSpace
+  return tex
 }

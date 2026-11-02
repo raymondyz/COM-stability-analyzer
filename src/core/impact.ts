@@ -72,8 +72,8 @@ export function edgeModels(hull: Hull, st: Statics, roller: Roller, face: number
 
 // Works back from zero kinetic energy at the top of the path. Each kink is a new
 // contact landing with speed: a plastic impact that conserves angular momentum
-// about the new pivot.
-function thresholdSpin(V: Float64Array, path: TipPath, k: Vec3, IGa: number, m: number, h0: number, r0: Vec3): number {
+// about the new pivot. `tumble` in tipPath.ts runs the same model forward.
+export function thresholdSpin(V: Float64Array, path: TipPath, k: Vec3, IGa: number, m: number, h0: number, r0: Vec3): number {
   const offset = (vertex: number) => {
     const p = get(V, vertex)
     return add(scale(p, -1), scale(k, dot(p, k)))
@@ -208,16 +208,21 @@ export function cornerModels(hull: Hull, st: Statics, roller: Roller, face: numb
   })
 }
 
+// The horizontal part of a spin w about corner c: its size, and the direction it
+// tips the bot toward.
+function cornerSpin(c: CornerModel, w: Vec3): { s: number, h: Vec3 } {
+  const wh = sub(w, scale(c.up, dot(w, c.up)))
+  const s = length(wh)
+  return { s, h: s < 1e-12 ? [0, 0, 0] : cross(scale(wh, 1 / s), c.up) }
+}
+
 // Where a spin per unit impulse w tips the bot over corner c: the interpolated
 // sample, the spin about the tipping axis, or null if c isn't the pivot.
 function cornerTip(c: CornerModel, w: Vec3): { s: number, omega: number, landing: number } | null {
   const tol = 1e-9 * length(w)
   for (const o of c.others) if (dot(w, o) < -tol * length(o)) return null   // another corner would sink
-  const wu = dot(w, c.up)
-  const wh = sub(w, scale(c.up, wu))
-  const s = length(wh)
+  const { s, h } = cornerSpin(c, w)
   if (s < 1e-12) return null
-  const h = cross(scale(wh, 1 / s), c.up)
   const t = Math.atan2(dot(h, c.e2), dot(h, c.e1)) / c.width
   if (t < -0.02 || t > 1.02) return null
   const x = Math.min(1, Math.max(0, t)) * (CORNER_SAMPLES - 1)
@@ -228,31 +233,39 @@ function cornerTip(c: CornerModel, w: Vec3): { s: number, omega: number, landing
   return { s, omega: a.omega + (b.omega - a.omega) * f, landing: (f < 0.5 ? a : b).landing }
 }
 
-export function hitOnCorner(c: CornerModel, p: Vec3, d: Vec3, mu: number, mass: number): { value: number, mEff: number, landing: number, outcome: Outcome } {
+interface CornerResult {
+  value: number
+  mEff: number
+  landing: number
+  outcome: Outcome
+  sample: number           // pushes: the tipping direction used (index into samples)
+}
+
+export function hitOnCorner(c: CornerModel, p: Vec3, d: Vec3, mu: number, mass: number): CornerResult {
   const tau = cross(sub(p, c.P), d)
   const w = mulMat(c.Iinv, tau)
   const mEff = 1 / dot(tau, w)
   const tip = cornerTip(c, w)
-  if (!tip || !Number.isFinite(tip.omega) || tip.landing < 0) return { value: Infinity, mEff, landing: -1, outcome: 'none' }
+  if (!tip || !Number.isFinite(tip.omega) || tip.landing < 0) return { value: Infinity, mEff, landing: -1, outcome: 'none', sample: -1 }
   const J = tip.omega / tip.s
   const vG = cross(w, scale(c.P, -1))
-  if (dot(vG, c.up) <= 0) return { value: Infinity, mEff, landing: -1, outcome: 'none' }
+  if (dot(vG, c.up) <= 0) return { value: Infinity, mEff, landing: -1, outcome: 'none', sample: -1 }
   const R = scale(sub(scale(vG, mass), d), J)
-  return { value: J, mEff, landing: tip.landing, outcome: groundCheck(R, c.up, mu) }
+  return { value: J, mEff, landing: tip.landing, outcome: groundCheck(R, c.up, mu), sample: -1 }
 }
 
-export function pushOnCorner(c: CornerModel, p: Vec3, d: Vec3, mu: number, mass: number, face: number): { value: number, mEff: number, landing: number, outcome: Outcome } {
+export function pushOnCorner(c: CornerModel, p: Vec3, d: Vec3, mu: number, mass: number, face: number): CornerResult {
   const tau = cross(sub(p, c.P), d)
-  let best = { value: Infinity, mEff: 0, landing: -1, outcome: 'none' as Outcome }
-  for (const s of c.samples) {
-    if (s.landing < 0 || s.landing === face) continue
+  let best: CornerResult = { value: Infinity, mEff: 0, landing: -1, outcome: 'none', sample: -1 }
+  c.samples.forEach((s, i) => {
+    if (s.landing < 0 || s.landing === face) return
     const lever = dot(tau, s.axis)
-    if (lever <= 1e-12) continue
+    if (lever <= 1e-12) return
     const F = (mass * GRAVITY * s.slope) / lever
-    if (F >= best.value) continue
+    if (F >= best.value) return
     const R = sub(scale(c.up, mass * GRAVITY), scale(d, F))
-    best = { value: F, mEff: 0, landing: s.landing, outcome: groundCheck(R, c.up, mu) }
-  }
+    best = { value: F, mEff: 0, landing: s.landing, outcome: groundCheck(R, c.up, mu), sample: i }
+  })
   return best
 }
 
@@ -277,6 +290,7 @@ export interface PivotResult {
   mEff: number             // the bot's effective mass at the hit point (impulse mode)
   landing: number
   outcome: Outcome
+  sample: number           // corner pushes: the tipping direction used
 }
 
 // The cheapest way this hit flips the bot out of pose `face`, or why it can't.
@@ -286,7 +300,7 @@ export function bestPivot(
   const results: PivotResult[] = []
   pv.edges.forEach((e, i) => {
     const r = mode === 'impulse' ? hitOnEdge(e, p, d, mu) : pushOnEdge(e, p, d, mu, mass)
-    results.push({ kind: 'edge', index: i, value: r.value, mEff: e.Ia / (r.lever * r.lever), landing: e.landing, outcome: r.outcome })
+    results.push({ kind: 'edge', index: i, value: r.value, mEff: e.Ia / (r.lever * r.lever), landing: e.landing, outcome: r.outcome, sample: -1 })
   })
   pv.corners.forEach((c, i) => {
     const r = mode === 'impulse' ? hitOnCorner(c, p, d, mu, mass) : pushOnCorner(c, p, d, mu, mass, face)
@@ -304,6 +318,42 @@ export function bestPivot(
           : tipping.some((r) => r.outcome === 'lift') ? 'lift'
             : 'returns'
   return { best: null, reason }
+}
+
+// The planar path a hit sends the bot along through pivot r: the great circle
+// u(θ) = cos θ·n + sin θ·m starting on hull vertex `start`, the inertia about the
+// tipping axis through the COM, and the spin each N·s of impulse starts.
+export interface HitPath {
+  m: Vec3
+  start: number
+  path: TipPath
+  IGa: number
+  spinPerJ: number         // impulse mode
+  value: number            // J_min or F_min, from this exact path
+}
+
+// n is the pose's down vector, h0 its COM height. For an impulse on a corner the
+// path is traced for this hit's own tipping direction instead of read from the
+// corner's table, so J_min here can differ slightly from the heatmap's.
+export function hitPath(pv: Pivots, r: PivotResult, V: Float64Array, count: number, n: Vec3, h0: number, p: Vec3, d: Vec3, inertia: Mat3, mass: number): HitPath {
+  const about = (axis: Vec3) => dot(axis, mulMat(inertia, axis))
+  if (r.kind === 'edge') {
+    const e = pv.edges[r.index]
+    const lever = dot(e.axis, cross(sub(p, e.q1), d))
+    return { m: e.out, start: e.a, path: e.path, IGa: about(e.axis), spinPerJ: lever / e.Ia, value: r.value }
+  }
+  const c = pv.corners[r.index]
+  if (r.sample >= 0) {
+    const phi = (c.width * r.sample) / (CORNER_SAMPLES - 1)
+    const h = add(scale(c.e1, Math.cos(phi)), scale(c.e2, Math.sin(phi)))
+    return { m: h, start: c.vertex, path: tipPath(V, count, n, h, c.vertex), IGa: about(c.samples[r.sample].axis), spinPerJ: 0, value: r.value }
+  }
+  const { s, h } = cornerSpin(c, mulMat(c.Iinv, cross(sub(p, c.P), d)))
+  const axis = normalize(cross(c.up, h))
+  const path = tipPath(V, count, n, h, c.vertex)
+  const IGa = about(axis)
+  const omega = thresholdSpin(V, path, axis, IGa, mass, h0, add(scale(c.P, -1), scale(axis, dot(c.P, axis))))
+  return { m: h, start: c.vertex, path, IGa, spinPerJ: s, value: omega / s }
 }
 
 // Impulse a weapon of effective mass mw delivers to a point of effective mass mEff.

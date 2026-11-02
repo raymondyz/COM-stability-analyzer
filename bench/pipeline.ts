@@ -5,7 +5,7 @@ import { simplify } from '../src/core/barriers.ts'
 import { classify } from '../src/core/equilibria.ts'
 import { heatRange } from '../src/core/heatmap.ts'
 import { buildHull } from '../src/core/hull.ts'
-import { cornerModels, edgeModels } from '../src/core/impact.ts'
+import { bestPivot, cornerModels, edgeModels, hitPath } from '../src/core/impact.ts'
 import { hullMoments, inertiaFromMoments, meshMoments } from '../src/core/inertia.ts'
 import { parseMassInput } from '../src/core/io/massReport.ts'
 import { parseStl } from '../src/core/io/stl.ts'
@@ -13,8 +13,9 @@ import { makeRoller, resolve, rollFrom } from '../src/core/roll.ts'
 import { sampleBot } from '../src/core/sample.ts'
 import { icosphere } from '../src/core/sphere.ts'
 import type { MassProps } from '../src/core/types.ts'
-import { get, scale } from '../src/core/vec.ts'
+import { add, cross, get, normalize, perpendicular, scale, sub } from '../src/core/vec.ts'
 import { displayMesh } from '../src/core/displayMesh.ts'
+import { tumble } from '../src/core/tipPath.ts'
 import { weld } from '../src/core/weld.ts'
 
 const rows: [string, number, string][] = []
@@ -74,6 +75,37 @@ const up = scale(hull.faces[face].normal, -1)
 time('Heatmap, one direction', () => heatRange(pv, face, { mode: 'impulse', mu: 0.5, mass: mass.mass, dirs: { kind: 'fixed', d: [1, 0, 0] } }, disp.positions, mass.com, disp.normals, out, 0, disp.groups.start.length - 1, disp.groups), () => `${n.toLocaleString()} vertices`)
 for (const pass of [0, 1]) {
   time(`Heatmap, worst direction, pass ${pass + 1}`, () => heatRange(pv, face, { mode: 'impulse', mu: 0.5, mass: mass.mass, dirs: { kind: 'worst', up, elevation: 0.5 } }, disp.positions, mass.com, disp.normals, out, 0, disp.groups.start.length - 1, disp.groups, pass))
+}
+
+// The click readout for a 45° rising hit at the point it flips most easily, at 3× the
+// impulse it needs there: pivot choice, tip path, the tumble and the roll to rest.
+// It takes the first pose and heading (of 8) from which anything flips.
+const hit = (() => {
+  for (const raw of simp.poses) {
+    const f = stable[raw]
+    const pvf = { edges: edgeModels(hull, st, roller, f, mass, inertia), corners: cornerModels(hull, st, roller, f, mass, inertia) }
+    const u = scale(hull.faces[f].normal, -1)
+    const e1 = perpendicular(u)
+    const e2 = cross(u, e1)
+    for (let k = 0; k < 8; k++) {
+      const d = normalize(add(u, add(scale(e1, Math.cos((k * Math.PI) / 4)), scale(e2, Math.sin((k * Math.PI) / 4)))))
+      heatRange(pvf, f, { mode: 'impulse', mu: 0.5, mass: mass.mass, dirs: { kind: 'fixed', d } }, disp.positions, mass.com, disp.normals, out, 0, disp.groups.start.length - 1, disp.groups)
+      let i = -1
+      for (let j = 0; j < n; j++) if (Number.isFinite(out[j]) && (i < 0 || out[j] < out[i])) i = j
+      if (i >= 0) return { f, pv: pvf, d, p: sub(get(disp.positions, i), mass.com) }
+    }
+  }
+  return null
+})()
+if (hit) {
+  const n0 = hull.faces[hit.f].normal
+  time('Hit at a point', () => {
+    const best = bestPivot(hit.pv, hit.f, hit.p, hit.d, 0.5, 'impulse', mass.mass).best!
+    const hp = hitPath(hit.pv, best, st.V, hull.count, n0, st.faceHeight[hit.f], hit.p, hit.d, inertia, mass.mass)
+    const t = tumble(st.V, hull.count, n0, hp.m, hp.start, hp.IGa, mass.mass, 3 * hp.value * hp.spinPerJ)
+    rollFrom(roller, normalize(add(scale(n0, Math.cos(t.rest)), scale(hp.m, Math.sin(t.rest)))), [])
+    return t
+  }, (t) => `${t.steps.length} steps, ${t.tops} tops`)
 }
 
 const w = Math.max(...rows.map((r) => r[0].length))

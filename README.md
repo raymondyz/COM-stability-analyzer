@@ -15,7 +15,7 @@ Everything runs in the browser. Models and mass properties never leave the compu
 4. Read the pose list, then use the three views:
    - **Poses** shows the bot at rest.
    - **Basins** shows where each starting orientation rolls. Click the shell to watch a roll.
-   - **Hits** shows how hard a hit at each point must be to flip the bot.
+   - **Hits** shows how hard a hit at each point must be to flip the bot. Pick a starting pose, click the bot to place a hit, then set its direction and strength to see where the bot ends up.
 
 If you don't have a model handy, "Try the sample bot" loads a generated four-wheel wedge.
 
@@ -41,3 +41,9 @@ pnpm ui-check bench/out --model docs/test_1.STL --mass docs/test_1.txt --dark
 `ui-check` needs Playwright's Chromium the first time: `pnpm exec playwright install chromium`.
 
 Test models in `docs/test_*` are gitignored. Tests that use them skip when the files are absent.
+
+## Deployment
+
+Pushes to `main` run [.github/workflows/deploy.yml](.github/workflows/deploy.yml): tests, build, then GitHub Pages. In the repo settings, Settings → Pages → Source must be "GitHub Actions", and the custom domain must stay empty.
+
+The site is served at `raymondz.dev/tools/stability-analyzer/`, where the portfolio's Cloudflare Worker forwards to the Pages address. Asset URLs are relative (`base: './'`), so the same build works at both addresses. The app keeps nothing in local storage, which matters because it shares an origin with the rest of raymondz.dev.

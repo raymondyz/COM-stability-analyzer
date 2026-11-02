@@ -1,16 +1,15 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type DragEvent } from 'react'
 import type { HitMode } from './core/heatmap.ts'
-import { LENGTH, LENGTH_UNITS, type LengthUnit } from './core/units.ts'
-import type { Vec3 } from './core/vec.ts'
+import { GRAVITY, LENGTH, LENGTH_UNITS, type LengthUnit } from './core/units.ts'
 import { HitControls } from './ui/HitControls.tsx'
-import { HIT_DEFAULTS, type HitSettings } from './ui/hitSettings.ts'
+import { HIT_DEFAULTS, strengthOf, type HitSettings } from './ui/hitSettings.ts'
 import { MassPanel, type MassState } from './ui/MassPanel.tsx'
-import { Busy, Empty, Help, Legend, ProbeCard, RollBar } from './ui/Overlays.tsx'
+import { Busy, Empty, Help, HitCard, Legend, RollBar } from './ui/Overlays.tsx'
 import { PoseList } from './ui/PoseList.tsx'
 import { heatColors, heatRange } from './viewer/colors.ts'
 import { Viewer, type ViewMode } from './viewer/Viewer.ts'
 import { Analyzer } from './worker/client.ts'
-import type { AnalysisResult, HitDirection, LoadResult, ProbeResult, RollResult } from './worker/protocol.ts'
+import type { AnalysisResult, HitDirection, LoadResult, PickResult, ProbeResult, RollResult } from './worker/protocol.ts'
 
 const SAMPLE_LABEL = 'the sample bot'
 const VIEWS: { id: ViewMode, label: string, hint: string }[] = [
@@ -39,13 +38,12 @@ export default function App() {
   const [threshold, setThreshold] = useState(0.0005)
   const [highPrecision, setHighPrecision] = useState(false)
   const [hit, setHit] = useState<HitSettings>(HIT_DEFAULTS)
-  const [cameraTick, setCameraTick] = useState(0)
   const [heat, setHeat] = useState<{ values: Float32Array, mode: HitMode } | null>(null)
   const [heatStatus, setHeatStatus] = useState<{ stage: string, fraction: number } | null>(null)
-  // Clicks and their results are tagged with the pose they belong to, so changing
-  // pose hides them without resetting state in an effect.
-  const [ray, setRay] = useState<{ origin: Vec3, dir: Vec3, pose: string } | null>(null)
-  const [probe, setProbe] = useState<{ result: ProbeResult | null, ray: object } | null>(null)
+  // The placed hit point is on the body, so it stays when the starting pose changes.
+  // Results are tagged with what they were computed for, so stale ones stay hidden.
+  const [target, setTarget] = useState<PickResult | null>(null)
+  const [probe, setProbe] = useState<{ result: ProbeResult | null, target: PickResult, pose: string } | null>(null)
   const [rollTime, setRollTime] = useState<{ time: number, total: number } | null>(null)
   const [rollLanding, setRollLanding] = useState<{ pose: number, key: string } | null>(null)
   const [help, setHelp] = useState(false)
@@ -55,7 +53,6 @@ export default function App() {
   useEffect(() => {
     const v = new Viewer(canvasRef.current!)
     viewerRef.current = v
-    v.onCameraSettled = () => setCameraTick((t) => t + 1)
     v.onAnimTime = (time, total) => setRollTime(total > 0 ? { time, total } : null)
     return () => {
       v.dispose()
@@ -77,7 +74,7 @@ export default function App() {
       setAnalysis(null)
       setAnalysisError(null)
       setHeat(null)
-      setRay(null)
+      setTarget(null)
       setSelectedFace(null)
       setMass((m) => (res.sampleMass ? { props: res.sampleMass, label: SAMPLE_LABEL, notes: [] } : m?.label === SAMPLE_LABEL ? null : m))
     } catch (e) {
@@ -156,9 +153,8 @@ export default function App() {
   const pose = analysis?.poses[selected] ?? null
   const poseKey = pose && analysis ? `${analysis.version}:${pose.face}` : ''
 
-  const activeRay = ray && ray.pose === poseKey ? ray : null
   const landing = rollLanding && rollLanding.key === poseKey ? rollLanding.pose : null
-  const shownProbe = view === 'hits' && activeRay && probe?.ray === activeRay ? probe.result : null
+  const shownProbe = view === 'hits' && target && probe?.target === target && probe.pose === poseKey ? probe.result : null
 
   useEffect(() => {
     viewerRef.current?.showPose(pose ? { down: pose.down, height: pose.height, support: pose.support } : null, false)
@@ -186,15 +182,15 @@ export default function App() {
         setRollLanding({ pose: res.pose, key: poseKey })
       }
     }
-    v.onBodyClick = (r) => setRay({ ...r, pose: poseKey })
+    v.onBodyClick = async (ray) => setTarget(await analyzer.request<PickResult | null>({ kind: 'pick', ray }))
   })
 
-  // The camera position is read when this is called, so callers re-run on cameraTick.
-  const hitDirection = useCallback((): HitDirection => {
-    const elev = (hit.elevation * Math.PI) / 180
-    return hit.dirMode === 'worst' ? { kind: 'worst', elevation: elev } : { kind: 'fixed', d: viewerRef.current!.cameraHitDirection(elev) }
-  }, [hit.dirMode, hit.elevation])
-  const cameraDep = hit.dirMode === 'camera' ? cameraTick : 0
+  // Reads the displayed pose when called, so callers re-run on pose changes.
+  const hitDirection = useCallback((): HitDirection => (
+    hit.aim === 'worst'
+      ? { kind: 'worst', elevation: (hit.elevation * Math.PI) / 180 }
+      : { kind: 'fixed', d: viewerRef.current!.bodyDirection(hit.heading, hit.elevation) }
+  ), [hit.aim, hit.heading, hit.elevation])
 
   // Heatmap for the selected pose and hit settings.
   useEffect(() => {
@@ -221,16 +217,16 @@ export default function App() {
       live = false
       clearTimeout(t)
     }
-  }, [analyzer, view, analysis, selected, mass, pose, hit.mode, hit.mu, hitDirection, cameraDep])
+  }, [analyzer, view, analysis, selected, mass, pose, hit.mode, hit.mu, hitDirection])
 
   const heatScale = useMemo(() => (heat ? heatRange(heat.values) : null), [heat])
   useEffect(() => {
     viewerRef.current?.setHeat(view === 'hits' && heat ? heatColors(heat.values, ...(heatScale ?? [1, 2])) : null)
   }, [heat, heatScale, view])
 
-  // Probe at the clicked point; refreshed when the hit settings change.
+  // What the placed hit does; refreshed when the pose or the hit settings change.
   useEffect(() => {
-    if (view !== 'hits' || !activeRay || !analysis || !mass) return
+    if (view !== 'hits' || !target || !analysis || !mass) return
     let live = true
     analyzer.request<ProbeResult | null>({
       kind: 'probe',
@@ -238,26 +234,37 @@ export default function App() {
       pose: selected,
       mass: mass.props,
       hit: { mode: hit.mode, mu: hit.mu, dir: hitDirection() },
-      ray: { origin: activeRay.origin, dir: activeRay.dir },
-      weapon: { mass: hit.weaponMass, speed: hit.weaponSpeed, restitution: hit.e },
-    }).then((result) => live && setProbe({ result, ray: activeRay }), () => live && setProbe({ result: null, ray: activeRay }))
+      point: target.point,
+      normal: target.normal,
+      strength: strengthOf(hit),
+    }).then(
+      (result) => live && setProbe({ result, target, pose: poseKey }),
+      () => live && setProbe({ result: null, target, pose: poseKey }),
+    )
     return () => {
       live = false
     }
-  }, [analyzer, activeRay, view, analysis, selected, mass, hit, hitDirection, cameraDep])
+  }, [analyzer, target, view, analysis, selected, poseKey, mass, hit, hitDirection])
 
   useEffect(() => {
     const v = viewerRef.current
-    if (!v) return
-    if (view !== 'hits') return
-    v.setProbe(shownProbe ? { point: shownProbe.point, dir: shownProbe.dir, pivot: shownProbe.pivot } : null)
+    if (!v || view !== 'hits') return
+    v.setProbe(shownProbe ? { point: shownProbe.point, dir: shownProbe.dir, pivot: shownProbe.pivot } : target && { point: target.point, dir: null, pivot: null })
     const dir = hitDirection()
-    if (shownProbe?.dir) v.setArrow(shownProbe.dir, shownProbe.point)
-    else if (dir.kind === 'fixed' && pose) v.setArrow(dir.d)
-    else v.setArrow(null)
-  }, [shownProbe, view, hitDirection, cameraDep, pose])
+    v.setArrow(shownProbe?.dir ?? (dir.kind === 'fixed' && pose ? dir.d : null), target?.point)
+  }, [shownProbe, target, view, hitDirection, pose])
+
+  // A new result replaces whatever motion was playing.
+  useEffect(() => {
+    if (viewerRef.current?.animating) viewerRef.current.resetToPose()
+  }, [shownProbe])
 
   const inertiaEstimated = !!mass && !mass.props.inertia
+  const escapeOf = (i: number) => {
+    const out = analysis?.poses[i]?.escape
+    return out && mass ? mass.props.mass * GRAVITY * out.lift : null
+  }
+  const hitResult = shownProbe?.result ?? null
   const settingsTitle = view === 'basins' ? 'Basins' : 'Hit settings'
 
   return (
@@ -329,7 +336,16 @@ export default function App() {
                     </label>
                   </>
                 ) : (
-                  <HitControls value={hit} onChange={setHit} inertiaEstimated={inertiaEstimated} />
+                  <HitControls
+                    value={hit}
+                    onChange={setHit}
+                    inertiaEstimated={inertiaEstimated}
+                    rank={rank}
+                    order={order}
+                    start={selected}
+                    onStart={(i) => analysis && setSelectedFace(analysis.poses[i].face)}
+                    placed={!!target}
+                  />
                 )}
               </div>
             </details>
@@ -361,15 +377,28 @@ export default function App() {
           {!model && !busy && <Empty onOpen={() => fileInput.current?.click()} onSample={openSample} />}
           {busy && <Busy {...busy} />}
           {loadError && <div className="banner error" role="alert">{loadError}</div>}
-          {view === 'hits' && heat && <Legend range={heatScale} mode={heat.mode} />}
+          {view === 'hits' && heat && !rollTime && <Legend range={heatScale} mode={heat.mode} />}
           {view === 'hits' && heatStatus && <div className="mini-busy">{heatStatus.stage}…</div>}
-          {shownProbe && <ProbeCard probe={shownProbe} mode={hit.mode} rank={rank} onClose={() => setRay(null)} />}
-          {view === 'hits' && analysis && !shownProbe && <div className="hint">Orbit to choose where the hit comes from. Click the bot for details.</div>}
-          {view === 'basins' && rollTime && (
+          {shownProbe && (
+            <HitCard
+              probe={shownProbe}
+              mode={hit.mode}
+              weapon={hit.mode === 'impulse' && hit.strength === 'weapon'}
+              rank={rank}
+              start={selected}
+              escapeOf={escapeOf}
+              onShow={() => hitResult && viewerRef.current?.playPath(hitResult.segments)}
+              onClose={() => setTarget(null)}
+            />
+          )}
+          {view === 'hits' && analysis && !target && (
+            <div className="hint">Click the bot to place a hit.</div>
+          )}
+          {view !== 'poses' && rollTime && (
             <RollBar
               time={rollTime.time}
               total={rollTime.total}
-              landing={landing}
+              landing={view === 'hits' ? hitResult?.pose ?? null : landing}
               rank={rank}
               onScrub={(t) => viewerRef.current?.setAnimTime(t)}
               onReplay={() => viewerRef.current?.replay()}

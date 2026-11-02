@@ -49,20 +49,38 @@ export interface HitSpec {
   dir: HitDirection
 }
 
-export interface Weapon {
-  mass: number                // effective mass, kg
-  speed: number               // closing speed, m/s
-  restitution: number
+// How hard the bot is hit: an impulse, a weapon whose impulse depends on the bot's
+// effective mass at the point, or a steady push.
+export type Strength =
+  | { kind: 'impulse', value: number }                                  // N·s
+  | { kind: 'weapon', mass: number, speed: number, restitution: number }  // kg, m/s
+  | { kind: 'force', value: number }                                    // N
+
+export interface PickResult {
+  point: Vec3                 // body frame
+  normal: Vec3                // surface normal, facing the camera
+}
+
+// What the applied hit does.
+export interface HitResult {
+  pose: number                // pose it ends in (-1: unknown)
+  tops: number                // times it goes over a top
+  maxTilt: number             // rad
+  energy: number | null       // kinetic energy given to the bot, J (impacts)
+  hardest: number             // most energy one landing absorbs, J: a real bot may bounce instead
+  complete: boolean           // false: still tumbling after a full turn, past what the model covers
+  segments: Segment[]         // the motion from rest, for the animation
 }
 
 export interface ProbeResult {
   point: Vec3                 // body frame
   dir: Vec3 | null            // hit direction used, body frame
-  value: number | null        // J_min (N·s) or F_min (N)
-  reason: Outcome
+  value: number | null        // J_min (N·s) or F_min (N) at this point in this direction
+  reason: Outcome | 'away'    // why nothing tips ('away': the surface faces away from the hit)
   pivot: { kind: 'edge' | 'corner', a: Vec3, b: Vec3 } | null   // relative to the COM
-  landing: number | null      // pose index
-  delivered: number | null    // impulse from the weapon at this point
+  landing: number | null      // pose a just-sufficient hit lands in
+  applied: number | null      // impulse (N·s) or force (N) applied
+  result: HitResult | null
 }
 
 export interface RollResult {
@@ -75,8 +93,8 @@ export type Request =
   | { kind: 'analyze', id: number, com: Vec3, threshold: number, level: number }
   | { kind: 'roll', id: number, version: number, down: Vec3 }
   | { kind: 'heatmap', id: number, version: number, pose: number, mass: MassProps, hit: HitSpec }
-  | { kind: 'probe', id: number, version: number, pose: number, mass: MassProps, hit: HitSpec, ray: { origin: Vec3, dir: Vec3 }, weapon: Weapon | null }
-
+  | { kind: 'pick', id: number, ray: { origin: Vec3, dir: Vec3 } }
+  | { kind: 'probe', id: number, version: number, pose: number, mass: MassProps, hit: HitSpec, point: Vec3, normal: Vec3, strength: Strength }
 
 export type Response =
   | { id: number, type: 'progress', stage: string, fraction: number }

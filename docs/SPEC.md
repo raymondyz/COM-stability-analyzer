@@ -29,7 +29,7 @@ Everything runs in the browser, with no server, uploads or accounts.
 
 | Release | Contents |
 |---|---|
-| **v1** | STL and OBJ import. Mass properties from a pasted SolidWorks Mass Properties report, JSON, or manual entry. Hull, equilibria and Poincaré–Hopf check. Pose list with probability, escape barrier and tilt-to-tip angle. Basin shell with click-to-roll. Energy to reach each other pose. Hit heatmap with a hover probe, push mode and a weapon calculator. |
+| **v1** | STL and OBJ import. Mass properties from a pasted SolidWorks Mass Properties report, JSON, or manual entry. Hull, equilibria and Poincaré–Hopf check. Pose list with probability, escape barrier and tilt-to-tip angle. Basin shell with click-to-roll. Energy to reach each other pose. Hit heatmap, push mode, and a hit tester: pick a starting pose, a point, a direction and a strength (impulse, weapon or force), and see where the bot ends up. |
 | **v1.x** | Merge-tree (disconnectivity) diagram. Rapier click-to-verify sim. Side-by-side comparison of several configurations, such as cam angles. |
 | **Later, if needed** | STEP import with a per-part mass table. A SolidWorks export macro, only if pasting the Mass Properties report turns out not to be enough. |
 
@@ -75,9 +75,9 @@ src/
     roll.ts             quasi-static roll, per-face destination table, path recording
     sphere.ts           icosphere levels and per-vertex area weights
     barriers.ts         merge tree, simplification, escape and pairwise barriers
-    tipPath.ts          planar tip path along a great circle
+    tipPath.ts          planar tip path along a great circle, and a hit's tumble along it
     inertia.ts          volume moments and the fallback inertia estimate
-    impact.ts           edge and corner pivot models, J_min, F_min, validity, weapon impulse
+    impact.ts           edge and corner pivot models, J_min, F_min, validity, a hit's exact path, weapon impulse
     heatmap.ts          allocation-free per-vertex kernel
     sample.ts           generated sample bot
     testShapes.ts       boxes, prisms and a tetrahedron for tests
@@ -108,7 +108,7 @@ docs/SPEC.md
 - **Orientation independence:** the app never asks which way is up or front, and nothing depends on how the model was oriented in CAD.
   - Poses are lettered by probability.
   - A pose is displayed with the hull's major horizontal axis (2D PCA of the hull vertices projected onto the ground) along world X.
-  - Hit directions are set relative to the camera.
+  - Hit directions are a heading and elevation against the bot as displayed, so 0° runs along that major axis.
 - **Precision:** Float64 in core, Float32 only for GPU buffers.
 - **Tolerances:** relative to the bounding-box diagonal unless stated otherwise.
 - **Code style:** 2-space indent, single quotes, no semicolons (matching the template), `const` over `let`.
@@ -162,7 +162,8 @@ Barriers are stored as COM lifts in metres and multiplied by m·g only for displ
 | `analyze` | COM, threshold, basin level | `AnalysisResult`: partial at level 4, then final |
 | `roll` | analysis version, starting `down` vector | path segments and the landing pose |
 | `heatmap` | analysis version, pose, mass properties, hit spec | Float32Array per display vertex (J or F; NaN where the direction can't reach; Infinity where nothing flips). Worst-direction mode sends a partial after its first pass. |
-| `probe` | analysis version, pose, mass properties, hit spec, ray in body coordinates, weapon | hit point, direction used, J or F, pivot (edge or corner), landing pose, weapon impulse, or the reason nothing flips |
+| `pick` | ray in body coordinates | the hit point and its surface normal, facing the camera, or null on a miss |
+| `probe` | analysis version, pose, mass properties, hit spec, point and normal, strength (impulse, weapon or force) | direction used, J_min or F_min, pivot (edge or corner), the pose a just-sufficient hit lands in, the applied impulse or force, and the result: final pose, how far it tips, energy given, the hardest landing, and the motion as segments. Or the reason nothing tips. |
 
 Sending the `File` rather than its bytes lets a units change re-read it without the main thread keeping a 93 MB copy. The worker caches pivot models keyed by analysis version, pose, mass and inertia.
 
@@ -288,6 +289,17 @@ Per hit (p, d):
 - Impulse delivered: J = (1 + e) v / (1/m_w + 1/m_eff). For a spinner, m_w = I_w / r².
 - The hit flips the bot if J ≥ J_min.
 
+**A hit of a given size** (`tumble` in `tipPath.ts`). J_min only says whether the bot leaves its pose. To say where a given hit sends it, the threshold-spin model runs forward:
+
+- The hit starts the bot spinning about the chosen pivot at ω₀ = J ℓ / I_a for an edge, or J s for a corner (s is the horizontal part of I_P⁻¹ τ per unit impulse). It then follows the same planar tip path the threshold uses.
+- Between contact changes, gravity trades kinetic energy for COM height. At each contact change, a plastic impact keeps angular momentum about the new pivot, which is the same ratio the threshold works back through. So the spin just above ω* goes over the first top, and just below it stays.
+- The path goes on past the first landing: a harder hit can carry the bot over further tops.
+- It ends when the energy runs out on a rise (the bot rocks back into the well it was in), or when an impact stops it dead. If it is still going after a full turn, it is past what the planar model covers, and the result is "keeps tumbling".
+- From the bottom of the well it settles in, the quasi-static roll finds the final pose.
+- For a corner, the forward path is traced for this hit's own tipping direction rather than read from the corner's 12-sample table. So J_min in the readout is exact, and can differ slightly from the heatmap color at that point.
+- A push isn't modelled forward: F ≥ F_min pushes it over the first top, and it lands without carrying momentum on. F < F_min leaves it where it is.
+- It also records the most energy any one landing absorbs. If that is more than it takes to leave the final pose, the readout warns that a real bot may bounce on: a plastic landing that absorbs hundreds of joules is the model's weakest point for hard hits.
+
 **Known approximations.** These appear in the UI's help text and are what the v1.x sim verifies.
 
 - **Plastic contact changes.** New contacts on the way over neither bounce nor slip.
@@ -314,10 +326,10 @@ Per hit (p, d):
 - **Where:** one value per display vertex, for the selected pose.
 - **Shared positions:** copies split along a crease share a position, and the value at a position only depends on the direction. Only "can this direction reach it" (d·n < 0) differs per copy, so the kernel runs once per position.
 - **Direction modes:**
-  - **From camera:** the hit travels horizontally away from the camera, tilted up by the chosen elevation. To pick a direction, orbit to the side you want hit from. 0° is horizontal (spinners, side hits from hammers), and positive elevation rises (wedges, flippers). An arrow in the viewport shows the current direction.
+  - **Set heading** (the default): a heading in degrees around the vertical, against the bot as displayed in its pose (0° runs along its long axis, from the hull's PCA), tilted up by the elevation. 0° elevation is horizontal (spinners, side hits from hammers), and positive elevation rises (wedges, flippers). An arrow in the viewport shows the direction. The camera has no part in it, so orbiting never changes the hit.
   - **Worst:** the lowest J_min over 12 azimuths, 30° apart, at the chosen elevation, with no per-vertex refinement. Near the best direction J grows like 1/cos(Δφ), so a miss costs at most 3.5%. It runs in two passes of 6 directions: the first pass is shown, then refined. The click probe searches 48 directions for its own number.
 - **Color:** log scale of J_min in N·s (F_min in N for pushes) between the 2nd and 98th percentiles, with a legend. Red is easy to flip, and neutral grey is hard. Blue-grey means "can't flip from here", and plain grey means "faces away from the hit".
-- **Probe:** clicking the bot raycasts in the worker, which has the full mesh, so the main thread never scans 2M triangles. It shows J_min, the pivot (a line for an edge, a dot for a corner), the landing pose, and the weapon verdict, or why nothing flips.
+- **Hit readout:** clicking the bot raycasts in the worker (`pick`), which has the full mesh, so the main thread never scans 2M triangles. The point stays fixed after that, and each change to the hit re-runs only `probe`, which is cheap (§4.1).
 
 ### 3.8 Mass properties input
 
@@ -383,13 +395,15 @@ Chrome's CPU throttling (CDP `Emulation.setCPUThrottlingRate`) did **not** slow 
 | Equilibria, destination table, barriers | COM or threshold change | 12 ms | 0.07 s |
 | Basins at level 4 / 6 / 7 | COM or threshold change | 4 / 28 / 106 ms | 0.02 / 0.17 / 0.64 s |
 | Pivot models for one pose | pose or mass change | 4 ms | 0.03 s |
-| Heatmap, one direction | hit settings or camera change | 36 ms | 0.22 s |
+| Heatmap, one direction | hit settings change | 36 ms | 0.22 s |
 | Heatmap, worst direction: pass 1, then pass 2 | hit settings change | 333 ms, then 321 ms | 2.0 s, then 1.9 s |
+| Hit readout at a placed point (pivot, tip path, tumble, roll to rest) | any change to the hit | 1 ms | < 0.01 s |
 
 In the browser (headless Chromium with software WebGL, at 1440 × 900):
 - From choosing `test_1.STL` to the model on screen: 1.4 s.
 - From pasting the report to the pose list: 2.6 s. This includes a 150 ms debounce and two software renders of 2M triangles.
 - Heatmap: 0.9 s.
+- Placing a hit adds one raycast over the display mesh in the worker (tens of milliseconds on `test_1`). After that, the readout updates without it.
 - The sample bot is under 0.5 s end to end.
 
 With the COM from `docs/test_1.txt`:
@@ -458,7 +472,11 @@ With the COM from `docs/test_1.txt`:
 - **Mass properties:** a paste box (the primary input), JSON and manual fields. A status line shows which values are in use and any sanity warnings.
 - **View settings** change with the active tab:
   - **Basins:** high precision.
-  - **Hits:** impulse or push, from-camera or worst direction, elevation, μ (default 0.5), e (default 0.3), and the weapon calculator.
+  - **Hits:**
+    - Starting pose: one chip per pose, the same choice as the pose list.
+    - Impact or slow push.
+    - Direction: a set heading (Heading slider, default 0°) or worst; elevation; μ (default 0.5).
+    - Hit strength: an impulse in N·s (default 5), or a weapon (effective mass, closing speed and restitution e, default 0.3), whose impulse depends on the bot's effective mass at the point. A force in N (default 100) for pushes.
 - **Pose list (always visible).** Each row shows:
   - a color swatch, matching the basin shell
   - a letter (Pose A is the most likely, then B, and so on)
@@ -474,10 +492,19 @@ With the COM from `docs/test_1.txt`:
 - **Poses:** the bot rests in the selected pose on a ground grid. A COM marker drops a line to the ground, and the support polygon is outlined on the ground.
 - **Basins:** the bot is shown in the selected pose inside a translucent shell colored by destination pose. The shell turns with the bot.
   - A point on the shell in body direction `u` means "if this side faces the floor".
-  - Clicking a point turns that side down and rolls the bot to rest. A scrub bar replays the roll.
-- **Hits:** the bot rests in the selected pose, painted with the J_min heatmap, with a legend.
-  - Clicking shows J_min, the pivot (an edge as a line, a corner as a dot) and the landing pose, or why the bot doesn't pivot. The readout refreshes when the hit settings change. There is no hover readout: the raycast runs in the worker and takes tens of milliseconds on 2M triangles.
-  - The weapon calculator compares the impulse delivered at the pinned point with J_min there.
+  - A blue ring lying flat on the shell marks the point under the pointer, and the cursor becomes a pointer, so it's clear the shell can be clicked. It hides off the shell and during orbit drags.
+  - Clicking a point plays three stages, so choosing the orientation reads apart from the roll. The bot turns that side down while rising until the shell rests on the floor at that point, gliding back to the middle of the floor as it turns, so every drop starts centred however far earlier rolls took it. After a short hold it drops onto the floor, then rolls to rest. A scrub bar replays all of it.
+- **Hits:** the bot rests in the starting pose, painted with the J_min heatmap, with a legend.
+  - Clicking the bot places a hit there: a dot, with an arrow for the direction. The point is on the body, so it stays when the starting pose changes. × on the card removes it.
+  - The card says where the bot ends up ("Stays in", "Ends in", or "Keeps tumbling"), and how: how far it tips before rocking back, or how far it turns before it settles. It also lists:
+    - the impulse or force applied, and the J_min or F_min that tips it out here, as a ratio
+    - the pose a just-sufficient hit lands in, when that differs from the start
+    - the energy given, next to the pose's cheapest escape energy
+    - the pivot (an edge as a line, a corner as a dot)
+    - a warning when one landing absorbs more energy than it takes to leave the final pose
+  - Or it says why nothing tips (faces away, slides, launches, lifts, returns).
+  - "Show the motion" plays the hit from rest: the tip, any further tumbling, and the roll to rest, with the same scrub bar as Basins. The bot stays centred and the floor grid slides under it, so a long tumble stays in view without the camera moving. The arrow moves with the floor.
+  - The readout refreshes when anything about the hit changes. There is no hover readout: the raycast runs in the worker and takes tens of milliseconds on 2M triangles.
 
 **Empty state:** a drop zone and a "Try the sample bot" button, which loads a generated four-wheel wedge so the app can be explored without a model.
 
@@ -485,7 +512,7 @@ With the COM from `docs/test_1.txt`:
 
 ## 6. Testing
 
-**Unit tests** (`pnpm test`, Vitest, `src/core`), 25 in total:
+**Unit tests** (`pnpm test`, Vitest, `src/core`), 30 in total:
 
 - **Hull:** a box with triangulated faces merges back to 6 quads, 8 vertices and 12 edges.
 - **Equilibria:**
@@ -506,6 +533,12 @@ With the COM from `docs/test_1.txt`:
   - A corner pivot picks up the off-centre hit.
   - The heatmap kernel agrees with the per-point evaluation on 200 random hits, for impact and push.
   - On a rounded corner, impact losses shrink as the facets get finer, ending within 5% of lossless at 32 facets.
+- **A hit of a given size** (forward tumble):
+  - Just below the threshold spin the bot stays; just above it, it goes over once and lands where the tip path says.
+  - Below the threshold, the tilt it reaches lifts the COM by exactly the energy given, and it rocks back to rest.
+  - Three times the threshold spin carries the box over its end and onto its back.
+  - A push goes over once and lands where the tip path says.
+  - For an off-centre hit, the exact corner path agrees with the corner table's J_min, and agrees with itself just below and above it.
 - **Input:**
   - The SolidWorks report parser reads SI values with negated products and passes both self-checks, and it rejects a paste whose products have the wrong sign.
   - The JSON format, binary and ASCII STL, and OBJ quads all parse.
@@ -532,8 +565,8 @@ quickhull3d's ESM build uses extensionless imports. Vite and Vitest resolve them
 | M1 | **Load and view:** STL and OBJ parsing and welding in the worker, units and axes, a viewer with orbit controls and on-demand rendering, mass properties (paste, JSON, manual) with sanity checks, a hull overlay, and the sample bot. | `test_1.STL` loads within budget, and a pasted report fills in mass, COM and inertia. | Done, without the hull overlay; there are no units or axes to set beyond file units |
 | M2 | **Statics:** polygon hull, equilibria, Poincaré–Hopf check, rolling with the destination table, streamed icosphere basins, the pose list, the Poses and Basins views, and the click-to-roll animation. | Unit tests pass, and a COM edit updates the poses within budget. | Done |
 | M3 | **Barriers:** saddle graph, merge tree, simplification threshold, escape barrier and cheapest exit, energy to reach each pose, inset and tilt-to-tip. | The tire-well and box tests pass. | Done; the tire-well test is still missing |
-| M4 | **Hits:** inertia (given or estimated), per-edge precompute, J_min with per-endpoint checks, the heatmap (fixed and worst direction), the probe readout, push mode and the weapon calculator. | The §6.3 example test passes, and the heatmap is within budget. | Done, plus corner pivots; the single-direction heatmap is over budget (§4.2) |
-| M5 | **Polish:** a pass at 6× throttle, help text for every number, error states, README and deployment. | Every budget is met at 6× throttle. | Partly: help, error states, README and `ui-check` are done; deployment and a real low-end laptop check are not |
+| M4 | **Hits:** inertia (given or estimated), per-edge precompute, J_min with per-endpoint checks, the heatmap (fixed and worst direction), the probe readout, push mode and the weapon calculator. | The §6.3 example test passes, and the heatmap is within budget. | Done, plus corner pivots and the hit tester (a hit of a given size, run forward); the single-direction heatmap is over budget (§4.2) |
+| M5 | **Polish:** a pass at 6× throttle, help text for every number, error states, README and deployment. | Every budget is met at 6× throttle. | Partly: help, error states, README, `ui-check` and the Pages workflow are done; the first deployment and a real low-end laptop check are not |
 | v1.x | Merge-tree diagram, Rapier verify sim, configuration comparison. | | Not started |
 
 **Rough effort:** M0 half a day, M1 a day, M2 two to three days, M3 a day, M4 two days, M5 a day.
@@ -542,7 +575,6 @@ quickhull3d's ESM build uses extensionless imports. Vite and Vitest resolve them
 
 ## 8. Open questions
 
-- **Hosting:** GitHub Pages or Cloudflare Pages. This sets Vite's `base` path.
 - **Default μ and e** are placeholders (0.5 and 0.3). At μ = 0.5, most hits on low bots slide rather than tip. That matches the notes for metal on steel, but is pessimistic for a bot resting on rubber tires.
 - **Validating corner pivots:** the corner model is the least checked part of the hit model. The v1.x Rapier sim is the way to check it.
 - **GPU on old laptops** (§4.3).
@@ -568,6 +600,11 @@ quickhull3d's ESM build uses extensionless imports. Vite and Vitest resolve them
 | 2026-10-31 | Worst direction: 12 azimuths in two passes, no refinement, computed once per shared position | It roughly halved the cost and gives a first paint in about 2 s at 6×. The error at the optimum is at most 3.5%. |
 | 2026-10-31 | Click to probe, not hover | The raycast over 2M triangles runs in the worker and takes tens of milliseconds, too slow to follow the mouse on slow machines. |
 | 2026-10-31 | Plain React state in `App.tsx`, no reducer or state library | The app is small; one component owns the state and the effects that sync it to the worker and viewer. |
+| 2026-11-01 | No "from camera" hit direction: always a set heading, or worst | User request. This replaces aiming by orbiting from the 2026-10-31 orientation row. A hit stays put while the view orbits, and the same settings give the same hit. |
+| 2026-11-01 | A hit tester on the Hits view: starting pose, point, direction and strength in; final pose out | User request. The threshold-spin model runs forward (§3.6), so the result agrees with J_min at the threshold and needs no new physics. Starting orientations are the resting poses, because a hit acts on a bot at rest. |
+| 2026-11-01 | Report how far a hit turns the bot, not how many tops it goes over | A faceted wheel puts a small top at every facet, so on the sample bot one roll onto its back counted as 4. |
+| 2026-11-01 | Hit animations keep the bot centred and slide the floor | A hard hit can tumble the bot 0.5 m or more, out of view. The camera stays still, as asked for Basins. The grid repeats, so it only shifts by less than one cell. |
+| 2026-11-01 | GitHub Pages, served at `raymondz.dev/tools/stability-analyzer/` through the portfolio's Cloudflare Worker | It is the portfolio's "external project" setup, the same as the shuffler. `base: './'` lets one build work at both addresses. A build served under that path was checked end to end: the worker, analysis and heatmap all ran with no failed requests. |
 | 2026-11-01 | The analysis worker starts on first use; `dispose()` only stops it | StrictMode's mount, unmount, remount in development terminated an eagerly created worker, so `pnpm dev` hung at "Reading file". The production build was unaffected, which is why the build-only UI check missed it. |
 | 2026-10-31 | Playwright as a dev dependency | It gives repeatable screenshots at laptop sizes and both themes, plus browser timings. |
 | 2026-10-31 | Orientation-independent UI: no up or front axis | User requirement. Poses get letters, display yaw comes from the hull's PCA, and hit directions come from the camera. |

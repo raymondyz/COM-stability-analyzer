@@ -1,12 +1,13 @@
 import { describe, expect, it } from 'vitest'
 import { classify } from './equilibria.ts'
 import { buildHull } from './hull.ts'
-import { bestPivot, cornerModels, edgeModels, hitOnEdge } from './impact.ts'
+import { bestPivot, cornerModels, edgeModels, hitOnEdge, hitPath } from './impact.ts'
 import { heatRange } from './heatmap.ts'
 import { makeRoller } from './roll.ts'
 import { boxMesh, prismMesh } from './testShapes.ts'
+import { tumble } from './tipPath.ts'
 import { GRAVITY } from './units.ts'
-import { sub, type Mat3, type Vec3 } from './vec.ts'
+import { dot, sub, type Mat3, type Vec3 } from './vec.ts'
 
 // Notes §6.3: a uniform 300 × 60 mm, 1.36 kg box (100 mm deep), tipping over its far bottom edge.
 const m = 1.36
@@ -103,6 +104,66 @@ describe('corner pivots', () => {
         else expect(out[0]).toBe(Infinity)
       }
     }
+  })
+})
+
+describe('forward tumble', () => {
+  // Tipping the §6.3 box over its far bottom edge, which turns about y.
+  const run = (omega: number | 'push') => {
+    const { hull, bottom, edges, far } = setup()
+    const st = classify(hull, com)
+    const e = edges[far]
+    const t = tumble(st.V, hull.count, hull.faces[bottom].normal, e.out, e.a, inertia[4], m, omega)
+    return { e, t, hull, st }
+  }
+
+  it('stays just below the threshold spin and goes over just above it', () => {
+    const { e, t: below } = run(0.999 * run(0).e.omega)
+    expect(below.complete).toBe(true)
+    expect(below.tops).toBe(0)
+    expect(below.rest).toBe(0)
+    expect(below.maxTilt).toBeLessThan(e.path.top)
+    const { t: above } = run(1.001 * e.omega)
+    expect(above.tops).toBe(1)
+    expect(above.rest).toBeCloseTo(e.path.land, 6)
+  })
+
+  it('tips as far as the energy it was given lifts the COM, then rocks back', () => {
+    const { e, t } = run(0.5 * run(0).e.omega)
+    const ke = 0.5 * e.Ia * (0.5 * e.omega) ** 2
+    const n: Vec3 = [0, 0, -1]
+    const h = (th: number) => dot(e.q1, n) * Math.cos(th) + dot(e.q1, e.out) * Math.sin(th)
+    expect(m * GRAVITY * (h(t.maxTilt) - h(0))).toBeCloseTo(ke, 9)
+    expect(t.steps.at(-1)!.to).toBe(0)
+  })
+
+  it('a harder hit carries it on over the next edge and onto its back', () => {
+    const { e, t } = run(3 * run(0).e.omega)
+    expect(t.tops).toBe(2)
+    // Down vector where it settles: past the end face, onto the top.
+    const u = [0, 1, 2].map((k) => [0, 0, -1][k] * Math.cos(t.rest) + e.out[k] * Math.sin(t.rest))
+    expect(u[2]).toBeGreaterThan(0.99)
+  })
+
+  it('a push goes over once and lands where the tip path says', () => {
+    const { e, t } = run('push')
+    expect(t.tops).toBe(1)
+    expect(t.rest).toBeCloseTo(e.path.land, 9)
+  })
+
+  it('agrees with the corner table on the threshold for an off-centre hit', () => {
+    const { hull, bottom, edges } = setup()
+    const st = classify(hull, com)
+    const corners = cornerModels(hull, st, makeRoller(hull, st), bottom, { mass: m, com, inertia }, inertia)
+    const p = rel([0, 0, 0])
+    const d: Vec3 = [0, 0, 1]
+    const res = bestPivot({ edges, corners }, bottom, p, d, 1, 'impulse', m)
+    const n = hull.faces[bottom].normal
+    const hp = hitPath({ edges, corners }, res.best!, st.V, hull.count, n, st.faceHeight[bottom], p, d, inertia, m)
+    expect(hp.value / res.best!.value).toBeCloseTo(1, 1)
+    const go = (J: number) => tumble(st.V, hull.count, n, hp.m, hp.start, hp.IGa, m, J * hp.spinPerJ)
+    expect(go(0.999 * hp.value).tops).toBe(0)
+    expect(go(1.001 * hp.value).tops).toBeGreaterThanOrEqual(1)
   })
 })
 

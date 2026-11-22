@@ -8,11 +8,14 @@ import { parseMassInput } from './massReport.ts'
 import { parseObj } from './obj.ts'
 import { parseStl } from './stl.ts'
 
-const f = (x: number) => x.toFixed(4)
+interface ReportOptions { flipXY?: boolean, digits?: number, massWord?: string, lengthWord?: string }
 
-// Builds report text in SolidWorks' layout from a mass (g), COM (mm) and products
-// of inertia in positive notation (g·mm²).
-function report(mass: number, c: number[], L: { xx: number, yy: number, zz: number, xy: number, xz: number, yz: number }, flipXY = false) {
+// Builds report text in SolidWorks' layout from a mass, COM and products of inertia
+// in positive notation (grams and millimetres unless told otherwise). Like SolidWorks,
+// it computes exactly and rounds only what it prints.
+function report(mass: number, c: number[], L: { xx: number, yy: number, zz: number, xy: number, xz: number, yz: number }, opts: ReportOptions = {}) {
+  const { flipXY = false, digits = 4, massWord = 'grams', lengthWord = 'millimeters' } = opts
+  const f = (x: number) => x.toFixed(digits)
   const tensor: Mat3 = [L.xx, -L.xy, -L.xz, -L.xy, L.yy, -L.yz, -L.xz, -L.yz, L.zz]
   const p = symEigenvalues(tensor)
   const o = {
@@ -23,26 +26,26 @@ function report(mass: number, c: number[], L: { xx: number, yy: number, zz: numb
      Configuration: Default
      Coordinate system: -- default --
 
-Mass = ${f(mass)} grams
+Mass = ${f(mass)} ${massWord}
 
-Center of mass: ( millimeters )
+Center of mass: ( ${lengthWord} )
 \tX = ${f(c[0])}
 \tY = ${f(c[1])}
 \tZ = ${f(c[2])}
 
-Principal axes of inertia and principal moments of inertia: ( grams *  square millimeters )
+Principal axes of inertia and principal moments of inertia: ( ${massWord} *  square ${lengthWord} )
 Taken at the center of mass.
 \t Ix = ( 1.0000,  0.0000, 0.0000)   \tPx = ${f(p[0])}
 \t Iy = ( 0.0000,  1.0000, 0.0000)   \tPy = ${f(p[1])}
 \t Iz = ( 0.0000,  0.0000, 1.0000)   \tPz = ${f(p[2])}
 
-Moments of inertia: ( grams *  square millimeters )
+Moments of inertia: ( ${massWord} *  square ${lengthWord} )
 Taken at the center of mass and aligned with the output coordinate system. (Using positive tensor notation.)
 \tLxx = ${f(L.xx)}\tLxy = ${f(xy)}\tLxz = ${f(L.xz)}
 \tLyx = ${f(xy)}\tLyy = ${f(L.yy)}\tLyz = ${f(L.yz)}
 \tLzx = ${f(L.xz)}\tLzy = ${f(L.yz)}\tLzz = ${f(L.zz)}
 
-Moments of inertia: ( grams *  square millimeters )
+Moments of inertia: ( ${massWord} *  square ${lengthWord} )
 Taken at the output coordinate system. (Using positive tensor notation.)
 \tIxx = 0\tIxy = ${f(o.xy)}\tIxz = ${f(o.xz)}
 \tIyx = ${f(o.xy)}\tIyy = 0\tIyz = ${f(o.yz)}
@@ -65,7 +68,16 @@ describe('SolidWorks mass properties report', () => {
   })
 
   it('rejects a paste whose products have the wrong sign', () => {
-    expect(() => parseMassInput(report(1360, [150, 50, 30], L, true))).toThrow()
+    expect(() => parseMassInput(report(1360, [150, 50, 30], L, { flipXY: true }))).toThrow()
+  })
+
+  it('accepts a report rounded to 2 decimal places', () => {
+    const lbIn = { digits: 2, massWord: 'pounds', lengthWord: 'inches' }
+    const Lb = { xx: 40, yy: 150, zz: 170, xy: 0.3, xz: 3.2, yz: -0.6 }
+    const r = parseMassInput(report(6, [0.374, -1.236, 2.118], Lb, lbIn))
+    expect(r.props.mass).toBeCloseTo(6 * 0.45359237, 9)
+    expect(r.checks).toHaveLength(2)
+    expect(() => parseMassInput(report(6, [0.374, -1.236, 2.118], Lb, { ...lbIn, flipXY: true }))).toThrow()
   })
 
   it('reads the JSON sidecar format', () => {
